@@ -68,7 +68,7 @@ You'll need these once publishing is built (see the [roadmap](../ROADMAP.md)), b
 1. [Google Cloud → New project](https://console.cloud.google.com/projectcreate), name it `StreamForge`, **Create**.
 2. Enable [YouTube Data API v3](https://console.cloud.google.com/apis/library/youtube.googleapis.com) and [YouTube Analytics API](https://console.cloud.google.com/apis/library/youtubeanalytics.googleapis.com) (click **Enable** on each).
 3. [Google Auth Platform](https://console.cloud.google.com/auth/overview) → **Get started**: app name `StreamForge`, your email, audience **External**, finish.
-4. [Audience](https://console.cloud.google.com/auth/audience) → **Publish app**. If you skip this and only add yourself as a test user, Google signs you out every 7 days.
+4. [Audience](https://console.cloud.google.com/auth/audience): **Add users** → your Gmail → **Save**. Without this, Google answers *"Access blocked: … has not completed verification" (Error 403: access_denied)*. Test-user sign-ins expire after 7 days. To avoid that, fill in the [Branding](https://console.cloud.google.com/auth/branding) page; **Publish app** is greyed out until Branding is complete. Then press **Publish app**.
 5. [Clients](https://console.cloud.google.com/auth/clients) → **Create client** → type **Desktop app** → **Create**. Copy the **Client ID** and **Client secret** into the YouTube card. Desktop apps don't need a redirect URL.
 6. **Sign in with YouTube**. Google warns *"Google hasn't verified this app"*: click **Advanced → Go to StreamForge (unsafe)**. It's your own app, so this is expected.
 
@@ -112,7 +112,7 @@ Leave the Meta app in **Development** mode. That's enough for your own accounts 
 | Sign-in says *"port 47821 is busy"* | Another sign-in is still waiting. Press **Cancel** on it, or quit and reopen StreamForge. |
 | Browser says *redirect_uri mismatch* / *invalid redirect* | The redirect URL in your developer app must be exactly `http://localhost:47821/callback`: no `https`, no trailing slash. |
 | Kick: *"Kick token request failed (401)"* | The Client ID or Secret is wrong. Copy them again from kick.com → Settings → Developer and press **Save** on each. |
-| Google: *"Access blocked: app has not completed verification"* | Your Google app is in Testing and your account isn't a test user. Publish the app (YouTube step 4) or add yourself under Audience → Test users. |
+| Google: *"Access blocked: … has not completed verification"* (Error 403: access_denied) | Your Google app is in Testing and your account isn't a test user. Add yourself under Audience → **Add users** (YouTube step 4), then press **Cancel** and **Sign in with YouTube** again in StreamForge. |
 | YouTube: *"couldn't read your YouTube channel"* | Enable **YouTube Data API v3** in the same Google Cloud project, and make sure the Google account you chose has a channel. |
 | Facebook: *"Invalid Scopes"* | The Meta app is missing the Page/Instagram use cases. Add them under **Use cases**, then sign in again. |
 | Facebook: *"No Facebook Pages granted"* | Sign in again and tick your Page (and Instagram) on the permissions screen. |
