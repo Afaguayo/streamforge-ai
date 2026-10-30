@@ -62,16 +62,17 @@ export default function Dashboard({ go }: { go: (p: PageId) => void }) {
         <Card title="Pipeline" className="col-span-2">
           <ul className="space-y-1.5 text-sm">
             {[
-              ["Ingest + metadata", true],
-              ["Transcription (Whisper)", false],
-              ["Moment detection + scoring", false],
-              ["Clip editing + subtitles", false],
-              ["Thumbnails + metadata", false],
-              ["Publishing (review first)", false],
-            ].map(([label, ready]) => (
-              <li key={label as string} className="flex items-center justify-between">
-                <span className={ready ? "" : "text-ink-500"}>{label}</span>
-                {ready ? <Badge tone="good">Active</Badge> : <Badge>Not built yet</Badge>}
+              ["Ingest + metadata", "Active"],
+              ["Transcription (whisper.cpp)", "Active"],
+              ["Moment detection + scoring", "Active"],
+              ["Clip editing + captions", "Active"],
+              ["Thumbnails + titles", "Active"],
+              ["YouTube + TikTok publishing", "Review first"],
+              ["Instagram + Facebook", "Pending Meta setup"],
+            ].map(([label, state]) => (
+              <li key={label} className="flex items-center justify-between">
+                <span className={state.startsWith("Pending") ? "text-ink-500" : ""}>{label}</span>
+                <Badge tone={state === "Active" ? "good" : state === "Review first" ? "info" : "neutral"}>{state}</Badge>
               </li>
             ))}
           </ul>

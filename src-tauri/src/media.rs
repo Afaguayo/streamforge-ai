@@ -74,6 +74,24 @@ fn parse_rate(s: &str) -> Option<f64> {
     (d > 0.0).then(|| (n / d * 100.0).round() / 100.0)
 }
 
+/// (free, total) bytes on the drive holding `path`.
+#[cfg(windows)]
+pub fn disk_space(path: &str) -> Option<(u64, u64)> {
+    extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    }
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: valid NUL-terminated UTF-16 path and out-pointers to live u64s.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then_some((avail, total))
+}
+
+#[cfg(not(windows))]
+pub fn disk_space(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
 #[derive(Debug, Serialize)]
 pub struct Toolchain {
     pub ffmpeg: Option<String>,

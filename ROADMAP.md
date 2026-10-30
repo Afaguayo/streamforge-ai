@@ -1,55 +1,53 @@
 # Roadmap
 
 ## Phase 1 — Foundation ✅
-- [x] Tauri 2 + React + TypeScript + Tailwind shell, all 12 navigation sections
+- [x] Tauri 2 + React + TypeScript + Tailwind shell, all navigation sections
 - [x] SQLite with versioned migrations
 - [x] Persistent job queue: crash recovery, retry with backoff, dedupe, retry/cancel in UI
 - [x] System tray, close-to-tray
-- [x] Settings (storage folders, polling, GPU, pause-while-live)
-- [x] Account Connections with Windows Credential Manager storage
-- [x] Dashboard: Kick status, latest recording, queue, activity log
-- [x] NSIS installer
+- [x] Settings, Account Connections (Windows Credential Manager), Dashboard
+- [x] NSIS installer, first-run Setup guide
 
-## Phase 2 — Kick + ingestion ✅ (Kick live polling untested against a real account)
-- [x] Kick app-token auth + live/offline polling (official API)
-- [x] Stream sessions recorded with title, start and end times
-- [x] Recording-folder watcher with "finished writing" detection
-- [x] Recording matched to the Kick session that just ended
+## Phase 2 — Kick + ingestion ✅
+- [x] Kick live/offline polling (official API) and user sign-in
+- [x] Recording-folder watcher, matched to the Kick session that just ended
 - [x] Manual import, FFprobe metadata, GPU/NVENC detection
-- [x] Kick user sign-in (OAuth 2.1 + PKCE), auto-fills the channel to monitor
 
-## Accounts ✅ (built 2026-10-29; real sign-ins need your developer apps)
-- [x] One-click browser sign-in: Kick, YouTube (Google), TikTok (desktop PKCE), Facebook + Instagram (Meta)
-- [x] Tokens in Windows Credential Manager, automatic refresh, Check / Sign in again / Disconnect
-- [x] Guided one-time developer-app setup per platform
-- [x] First-run Setup guide (FFmpeg, recording folder, Kick, publishing accounts) that ticks steps off live (v0.1.1)
+## Accounts ✅
+- [x] One-click sign-in: Kick ✓ tested, YouTube ✓ tested, TikTok ✓ tested (sandbox), Facebook + Instagram (built, untested: Meta registration pending)
 
-## Phase 3 — AI clips
-- [ ] Python worker (`worker/`) with faster-whisper (CUDA, CPU fallback), word timestamps, ES/EN
-- [ ] Signals: loudness/excitement, laughter, scene changes, speech rate
-- [ ] LLM scoring of candidate windows (hook, entertainment, emotion, context, replay, shareability, trend)
-- [ ] Clip boundaries ≥ 60 s, extended to sentence/story boundaries, never padded
-- [ ] 9:16 reframing (face/webcam + gameplay layouts), loudnorm, animated word-by-word ASS subtitles
-- [ ] AI Clip Studio: preview, approve/reject/edit/regenerate
+## Phase 3 — AI clips ✅ (v0.2.0)
+- [x] whisper.cpp transcription (CUDA build, CPU fallback), word timestamps, Spanish/English auto-detect; one-click install
+- [x] Signals: loudness vs. the stream's own median, laughter and excitement words (ES + EN), speech density, scene changes
+- [x] Candidate windows 60–120 s, edges snapped to pauses in speech, never padded; recordings < 60 s give no clips
+- [x] Scores: hook, entertainment, emotion, context, replay, shareability, trend; heuristic by default, Claude (transcript-based) when an API key is set
+- [x] 9:16 render: blurred-fill or facecam-on-top layout, animated word-by-word captions, on-screen hook, loudnorm, NVENC/x264 at low priority
+- [x] AI Clip Studio: preview, approve/reject/restore, edit trims/title/hook, re-render
+- [ ] Face/subject tracking for automatic reframing (fixed layouts for now)
+- [ ] Game-event detection (kill feeds etc.)
 
-## Phase 4 — Thumbnails, trends, competitors
-- [ ] Frame selection + face/expression detection, background removal, layered 1280×720 compositions, 3 ranked concepts
-- [ ] Vertical covers
-- [ ] Trend research from official APIs (YouTube Data API first), daily report
-- [ ] Competitor watchlist
+## Phase 4 — Thumbnails, trends, competitors ✅ (v0.2.0)
+- [x] Three 1280×720 thumbnail concepts per stream from its strongest moments; vertical covers per clip
+- [x] Daily trend report from the YouTube Data API: views, engagement, short-form share, title patterns, words, hashtags, best hour
+- [x] Competitor watchlist (YouTube): posting frequency, average views, shorts share, breakout videos
+- [ ] AI image generation / background removal for thumbnails
+- [ ] TikTok/Instagram trend data (no official API for other creators' content)
 
-## Phase 5 — Publishing
-- [ ] YouTube resumable upload + thumbnails (sign-in already done)
-- [ ] TikTok Content Posting API (audit status shown)
-- [ ] Instagram Reels, Facebook Reels (Graph API)
-- [ ] Upload queue: review-first, retry, duplicate prevention, per-platform duration checks
+## Phase 5 — Publishing ✅ for YouTube + TikTok (v0.2.0)
+- [x] YouTube resumable upload (8 MB chunks, resume), Shorts, full-stream upload with selected thumbnail
+- [x] TikTok Direct Post (chunked, creator-info duration and privacy checks)
+- [x] Upload queue: review-first drafts, edit metadata, publish now, schedule, retries, duplicate prevention, per-platform duration checks
+- [x] Titles/captions/hashtags: Claude when a key is set, otherwise from the clip and trend hashtags
+- [ ] Instagram Reels, Facebook Reels (needs Meta developer registration)
 
-## Phase 6 — Analytics + automation
-- [ ] Real analytics per platform, charts
-- [ ] Feedback loop into clip and thumbnail scoring
-- [ ] Publishing calendar, scheduling, opt-in full automation
+## Phase 6 — Analytics + automation ✅ (v0.2.0)
+- [x] YouTube stats snapshots every 6 h; views over time, by platform, clip type and posting hour
+- [x] Feedback loop: clip types with 3+ published clips nudge scores (+20 % / −15 %)
+- [x] Publishing calendar with drag-and-drop scheduling
+- [x] Opt-in full automation: best clips approved and scheduled N per day
+- [ ] TikTok stats (needs audited app + video.list)
 
 ## Phase 7 — Hardening
+- [x] Disk-space monitor (pauses below 2 GB), temp-file cleanup
 - [ ] Auto-update (Tauri updater + signed releases)
-- [ ] Disk-space monitor and temp cleanup
-- [ ] Performance pass, user guide
+- [ ] Code signing

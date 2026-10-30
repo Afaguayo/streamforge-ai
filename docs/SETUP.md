@@ -10,7 +10,8 @@ This walks you through everything once, start to finish. Plan on **10–15 minut
 3. [Point StreamForge at your OBS recordings](#3-point-streamforge-at-your-obs-recordings)
 4. [Connect Kick](#4-connect-kick)
 5. [Connect YouTube, TikTok, Facebook + Instagram (optional)](#5-connect-where-you-post-optional)
-6. [Troubleshooting](#troubleshooting)
+6. [Turn on AI clips](#6-turn-on-ai-clips)
+7. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -102,6 +103,16 @@ Leave the Meta app in **Development** mode. That's enough for your own accounts 
 
 ---
 
+## 6. Turn on AI clips
+1. **Settings → AI processing → Install.** This downloads the transcription engine (whisper.cpp, ~1.2 GB with NVIDIA support) and the speech model (466 MB). Everything runs on your PC.
+2. Optional: paste a **Claude API key** from [console.anthropic.com](https://console.anthropic.com/settings/keys). Clips are then rated from their transcripts and get titles and on-screen hooks. Without it, clips are ranked by loudness, laughter and excitement words.
+3. Pick a **clip layout**: gameplay on a blurred background, or webcam on top. For the webcam layout, enter where your camera sits in the recording (percent of the frame).
+4. After your next stream (or **Video Library → ✨ Find clips** on any recording), the best clips appear in **AI Clip Studio**, already rendered. Approve the ones you like; drafts appear in the **Upload Queue**, where you edit titles and press **Publish now** or **Schedule**.
+
+A 3-hour stream takes roughly 10–20 minutes to transcribe on an RTX 3060. Heavy work waits while you're live.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -116,6 +127,10 @@ Leave the Meta app in **Development** mode. That's enough for your own accounts 
 | YouTube: *"couldn't read your YouTube channel"* | Enable **YouTube Data API v3** in the same Google Cloud project, and make sure the Google account you chose has a channel. |
 | Facebook: *"Invalid Scopes"* | The Meta app is missing the Page/Instagram use cases. Add them under **Use cases**, then sign in again. |
 | Facebook: *"No Facebook Pages granted"* | Sign in again and tick your Page (and Instagram) on the permissions screen. |
+
+| "Waiting: less than 2 GB free disk space" | Free up space or choose an output folder on another drive in Settings → Storage; **Delete temp files** clears leftovers. |
+| Clip Studio is empty after a stream | Check the Dashboard queue. The transcription engine must be installed, and recordings under 60 seconds never produce clips. |
+| TikTok post is private | Expected until TikTok audits your app: unaudited apps can only post with "Only me". |
 
 Still stuck? [Open an issue](https://github.com/Afaguayo/streamforge-ai/issues) with the message from **Dashboard → Activity**.
 

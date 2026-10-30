@@ -70,6 +70,92 @@ const MIGRATIONS: &[&str] = &[
         last_error    TEXT
     );
     "#,
+    // 3: AI clips, publishing, analytics, research
+    r#"
+    CREATE TABLE transcripts (
+        stream_id   INTEGER PRIMARY KEY REFERENCES streams(id) ON DELETE CASCADE,
+        language    TEXT,
+        words       TEXT NOT NULL,                  -- JSON [[start_s, end_s, "word"], ...]
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+
+    CREATE TABLE clips (
+        id            INTEGER PRIMARY KEY,
+        stream_id     INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+        start_s       REAL NOT NULL,
+        end_s         REAL NOT NULL,
+        score         REAL NOT NULL,
+        scores        TEXT NOT NULL DEFAULT '{}',   -- hook, entertainment, emotion, context, replay, shareability, trend
+        category      TEXT,
+        title         TEXT,
+        hook          TEXT,
+        reason        TEXT,
+        transcript    TEXT,
+        scored_by     TEXT NOT NULL DEFAULT 'heuristic', -- heuristic | claude
+        status        TEXT NOT NULL DEFAULT 'suggested', -- suggested | approved | rejected
+        render_status TEXT NOT NULL DEFAULT 'none',      -- none | queued | done | error
+        render_path   TEXT,
+        cover_path    TEXT,
+        error         TEXT,
+        created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+
+    CREATE TABLE thumbnails (
+        id         INTEGER PRIMARY KEY,
+        stream_id  INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+        path       TEXT NOT NULL,
+        rank       INTEGER NOT NULL,
+        concept    TEXT NOT NULL,
+        selected   INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+
+    CREATE TABLE posts (
+        id           INTEGER PRIMARY KEY,
+        clip_id      INTEGER REFERENCES clips(id) ON DELETE CASCADE,
+        stream_id    INTEGER REFERENCES streams(id) ON DELETE CASCADE,  -- set for full-length uploads
+        platform     TEXT NOT NULL,                  -- youtube | tiktok
+        title        TEXT NOT NULL,
+        description  TEXT NOT NULL DEFAULT '',
+        tags         TEXT NOT NULL DEFAULT '[]',
+        privacy      TEXT NOT NULL DEFAULT 'private',
+        scheduled_at TEXT,
+        status       TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | uploading | published | failed
+        progress     REAL NOT NULL DEFAULT 0,
+        remote_id    TEXT,
+        url          TEXT,
+        error        TEXT,
+        published_at TEXT,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+    CREATE UNIQUE INDEX posts_clip_platform ON posts(clip_id, platform) WHERE clip_id IS NOT NULL;
+    CREATE UNIQUE INDEX posts_stream_platform ON posts(stream_id, platform) WHERE stream_id IS NOT NULL;
+
+    CREATE TABLE post_stats (
+        post_id  INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        ts       TEXT NOT NULL,
+        views    INTEGER, likes INTEGER, comments INTEGER, shares INTEGER,
+        PRIMARY KEY (post_id, ts)
+    );
+
+    CREATE TABLE watchlist (
+        id          INTEGER PRIMARY KEY,
+        handle      TEXT NOT NULL UNIQUE,            -- YouTube @handle or channel id
+        channel_id  TEXT,
+        title       TEXT,
+        subscribers INTEGER,
+        summary     TEXT NOT NULL DEFAULT '{}',
+        checked_at  TEXT,
+        error       TEXT
+    );
+
+    CREATE TABLE trend_reports (
+        id         INTEGER PRIMARY KEY,
+        keywords   TEXT NOT NULL,
+        report     TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+    "#,
 ];
 
 pub struct Db(Mutex<Connection>);

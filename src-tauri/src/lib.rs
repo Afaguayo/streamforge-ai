@@ -1,13 +1,21 @@
+mod analysis;
 mod commands;
 mod db;
 mod ingest;
 mod jobs;
 mod kick;
+mod llm;
 mod media;
 mod oauth;
 mod pipeline;
+mod posts;
+mod publish;
+mod render;
+mod research;
 mod secrets;
 mod settings;
+mod studio;
+mod tools;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -51,7 +59,9 @@ pub fn run() {
 
             tauri::async_runtime::spawn(kick::monitor_loop(db.clone(), kick_client.clone(), kick_state.clone()));
             tauri::async_runtime::spawn(ingest::watch_loop(db.clone()));
-            tauri::async_runtime::spawn(pipeline::worker_loop(db.clone(), kick_state.clone()));
+            let ctx = pipeline::Ctx { db: db.clone(), data_dir: data_dir.clone() };
+            tauri::async_runtime::spawn(pipeline::worker_loop(ctx, kick_state.clone()));
+            tauri::async_runtime::spawn(pipeline::scheduler_loop(db.clone()));
 
             app.manage(AppState { db, kick: kick_state, kick_client, data_dir, sign_in_cancel: Mutex::new(None) });
 
@@ -105,6 +115,34 @@ pub fn run() {
             commands::cancel_sign_in,
             commands::check_account,
             commands::disconnect_account,
+            studio::engine_status,
+            studio::install_engine,
+            studio::process_stream,
+            studio::list_clips,
+            studio::approve_clip,
+            studio::reject_clip,
+            studio::restore_clip,
+            studio::edit_clip,
+            studio::render_clip,
+            studio::list_thumbnails,
+            studio::select_thumbnail,
+            studio::regenerate_thumbnails,
+            studio::list_posts,
+            studio::update_post,
+            studio::schedule_post,
+            studio::unschedule_post,
+            studio::delete_post,
+            studio::draft_full_video,
+            studio::analytics,
+            studio::refresh_stats,
+            studio::latest_trend_report,
+            studio::run_trend_report,
+            studio::list_watchlist,
+            studio::add_watch,
+            studio::remove_watch,
+            studio::refresh_watchlist,
+            studio::clean_temp,
+            studio::disk_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running StreamForge AI");

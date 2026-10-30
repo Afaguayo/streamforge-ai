@@ -19,7 +19,13 @@ import Library from "./pages/Library";
 import LiveMonitor from "./pages/LiveMonitor";
 import Connections from "./pages/Connections";
 import SettingsPage from "./pages/Settings";
-import Planned from "./pages/Planned";
+import ClipStudio from "./pages/ClipStudio";
+import Thumbnails from "./pages/Thumbnails";
+import Trends from "./pages/Trends";
+import Competitors from "./pages/Competitors";
+import Calendar from "./pages/Calendar";
+import UploadQueue from "./pages/UploadQueue";
+import Analytics from "./pages/Analytics";
 import Setup from "./pages/Setup";
 import { api } from "./lib/api";
 
@@ -102,7 +108,7 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.1.1 · review mode on</div>
+        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.2.0</div>
       </aside>
       <main className="flex-1 overflow-y-auto">
         {page === "dashboard" && <Dashboard go={setPage} />}
@@ -111,7 +117,13 @@ export default function App() {
         {page === "connections" && <Connections />}
         {page === "settings" && <SettingsPage />}
         {page === "setup" && <Setup go={setPage} />}
-        {["clips", "thumbnails", "trends", "competitors", "calendar", "uploads", "analytics"].includes(page) && <Planned page={page} />}
+        {page === "clips" && <ClipStudio go={setPage} />}
+        {page === "thumbnails" && <Thumbnails />}
+        {page === "trends" && <Trends />}
+        {page === "competitors" && <Competitors />}
+        {page === "calendar" && <Calendar go={setPage} />}
+        {page === "uploads" && <UploadQueue />}
+        {page === "analytics" && <Analytics />}
       </main>
     </div>
   );

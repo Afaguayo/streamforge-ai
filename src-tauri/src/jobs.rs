@@ -59,11 +59,11 @@ pub fn backoff_secs(attempt: i64) -> i64 {
 impl Db {
     pub fn enqueue(&self, kind: &str, stream_id: Option<i64>, payload: &str) -> Result<i64> {
         let conn = self.conn();
-        // Duplicate prevention: one live job per (kind, stream).
+        // Duplicate prevention: one live job per (kind, stream, payload).
         let existing: Option<i64> = conn
             .query_row(
-                "SELECT id FROM jobs WHERE kind=?1 AND stream_id IS ?2 AND status IN ('queued','running')",
-                params![kind, stream_id],
+                "SELECT id FROM jobs WHERE kind=?1 AND stream_id IS ?2 AND payload=?3 AND status IN ('queued','running')",
+                params![kind, stream_id, payload],
                 |r| r.get(0),
             )
             .optional()?;
@@ -75,6 +75,13 @@ impl Db {
             params![kind, stream_id, payload, now_str()],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Like `enqueue`, but not before `run_after` (UTC, `%Y-%m-%dT%H:%M:%SZ`).
+    pub fn enqueue_at(&self, kind: &str, stream_id: Option<i64>, payload: &str, run_after: &str) -> Result<i64> {
+        let id = self.enqueue(kind, stream_id, payload)?;
+        self.conn().execute("UPDATE jobs SET run_after=?2 WHERE id=?1 AND status='queued'", params![id, run_after])?;
+        Ok(id)
     }
 
     /// Called once at startup. Returns how many jobs were resumed.

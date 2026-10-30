@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { FolderOpen, Plus, RefreshCw } from "lucide-react";
+import { FolderOpen, Plus, RefreshCw, Sparkles, Youtube } from "lucide-react";
 import { useState } from "react";
 import type { PageId } from "../App";
 import { StreamStatus } from "../components/StreamBits";
@@ -96,6 +96,16 @@ export default function Library({ go }: { go: (p: PageId) => void }) {
                       {s.file_path && (
                         <button title="Read metadata again" className="hover:text-white" onClick={() => run(() => api.reprobe(s.id))}>
                           <RefreshCw size={15} />
+                        </button>
+                      )}
+                      {s.duration_s != null && (
+                        <button title="Find clips (transcribe and analyse)" className="hover:text-white" onClick={() => run(async () => { await api.processStream(s.id); setMsg({ tone: "good", text: "Finding clips; progress is on the Dashboard." }); })}>
+                          <Sparkles size={15} />
+                        </button>
+                      )}
+                      {s.duration_s != null && (
+                        <button title="Draft the full stream for YouTube" className="hover:text-white" onClick={() => run(async () => { await api.draftFullVideo(s.id); setMsg({ tone: "good", text: "Full-stream draft added to the Upload Queue." }); })}>
+                          <Youtube size={15} />
                         </button>
                       )}
                     </div>

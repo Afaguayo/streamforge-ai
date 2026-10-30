@@ -6,7 +6,7 @@ A Windows desktop app built with Tauri 2, Rust, React, SQLite and FFmpeg.
 
 ![StreamForge setup guide](docs/screenshots/setup.png)
 
-> **Status: early preview (v0.1).** The foundation works today: live detection, automatic recording import, a crash-safe processing queue, and sign-in to every platform. AI clipping, subtitles, thumbnails and publishing are being built next; see the [roadmap](ROADMAP.md). Features that aren't built yet say so in the app. Nothing shows fake data.
+> **Status: v0.2 preview.** The whole pipeline is in: live detection → recording import → transcription → best-moment detection → 60–120 s vertical clips with animated captions → thumbnails → review → YouTube and TikTok publishing → real analytics. Instagram and Facebook are waiting on Meta's developer registration. See the [roadmap](ROADMAP.md). Nothing in the app shows fake data.
 
 ## Download
 **[⬇ Download the latest installer](https://github.com/Afaguayo/streamforge-ai/releases/latest)** (`StreamForge.AI_<version>_x64-setup.exe`, Windows 10/11, about 4 MB)
@@ -17,6 +17,11 @@ Then follow the **[setup guide](docs/SETUP.md)**. It takes about 10 minutes, and
 | | |
 |---|---|
 | **Guided first-run setup** | A step-by-step checklist inside the app that ticks itself off as you go. |
+| **AI clips** | Transcribes your stream on your GPU (whisper.cpp, Spanish + English), finds the moments with laughter, hype and loud reactions, and cuts 60–120 s clips that start and end on full sentences. Optional Claude rating reads the transcript to judge hook, context and replay value. |
+| **Vertical editing** | 9:16 with a blurred fill or your webcam on top, animated word-by-word captions, an on-screen hook, loudness normalisation, NVENC encoding at low priority. |
+| **Thumbnails** | Three 1280×720 concepts per stream from its strongest moments, plus vertical covers. |
+| **Publishing** | YouTube (Shorts and full streams) and TikTok, review-first: drafts, scheduling, a drag-and-drop calendar, retries. |
+| **Research + analytics** | Daily YouTube trend report for your keywords, a competitor watchlist, and your own views/likes over time, which also tune clip scoring. |
 | **Kick live detection** | Sees when you go live and when you stop, through Kick's official API. |
 | **Automatic recording import** | Watches your OBS recording folder, waits until the file is finished, matches it to the stream that just ended, and reads its length, resolution and codecs. |
 | **One-click sign-in** | Kick, YouTube, TikTok and Facebook + Instagram. Your browser opens, you approve, and it stays connected; logins renew automatically. |

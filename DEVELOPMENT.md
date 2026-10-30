@@ -13,11 +13,14 @@ The Rust core owns all state. Long-running engines are background tasks started 
 |---------------------------|-------------------------------|--------|
 | Kick Stream Monitor       | `kick.rs::monitor_loop`       | built  |
 | VOD Ingestion             | `ingest.rs::watch_loop`       | built  |
-| Video Processing Engine   | `pipeline.rs` + `media.rs`    | metadata only |
-| Transcription / Moments / Clip editing | `worker/` (Python), called as jobs | Phase 3 |
-| Thumbnails / Trends / Metadata | jobs + worker            | Phase 4 |
+| Video Processing Engine   | `pipeline.rs` + `media.rs`    | built  |
+| Speech Transcription      | `analysis.rs` (whisper.cpp, installed by `tools.rs`) | built |
+| AI Moment Detection       | `analysis.rs` + optional `llm.rs` (Claude) | built |
+| Clip Editing / Thumbnails | `render.rs` (FFmpeg + ASS captions) | built |
+| Metadata Generation       | `posts.rs` + `llm.rs`         | built  |
+| Publishing                | `publish.rs` (YouTube, TikTok), `posts.rs` queue | built (IG/FB pending) |
+| Analytics / Trends / Watchlist | `research.rs`            | built (YouTube data) |
 | Account sign-in (OAuth)   | `oauth.rs`                    | built  |
-| Publishing / Analytics    | Rust (HTTP), tokens via `oauth::access_token` | Phase 5–6 |
 
 ### Job queue (`jobs.rs`)
 - Every unit of work is a row in `jobs`, so work is resumable by design. On startup, `running` → `queued`.
@@ -43,9 +46,17 @@ Local imports start at `queued`.
 - `oauth::access_token(provider)` returns a fresh token for uploads, refreshing it when it expires within 2 minutes. TikTok rotates refresh tokens; Google keeps the old one.
 - Token blobs are stored as `<platform>.token` in Credential Manager. The `accounts` table stores only the display name, IDs and Pages.
 
+### Clip pipeline
+`probe → transcribe → analyze → render (top N) + thumbnails → [approve] → publish`. Each arrow is a queued job; `is_heavy` jobs wait while you're live and when disk space is under 2 GB.
+- Transcription: `whisper-cli -ml 1 -sow -oj` gives one word per segment with millisecond offsets; stored as `[[start, end, word], …]` in `transcripts`.
+- Moments: per-second features → smoothed excitement → peaks → windows (35 s lead-in, 40 s payoff) snapped to pauses, clamped to 60–120 s, non-overlapping.
+- Claude (`claude-opus-5-5`, structured JSON output, `fallbacks: "default"`) re-scores candidates and writes titles/hooks only when `llm.api_key` is set; failures fall back to heuristic scores.
+- Captions: ASS karaoke, one phrase (≤3 words) at a time, phrases never overlap; FFmpeg runs from the work folder so `subtitles=subs.ass` needs no path escaping.
+
 ## Tests
 - `cd src-tauri && cargo test`: migrations, queue recovery/retry/dedupe, Kick parsing and session transitions, ingestion stability and matching, FFprobe parsing, settings, PKCE (RFC 7636 vector + TikTok hex), sign-in URLs, callback parsing, token refresh handling, a real loopback callback.
 - `npm test`: formatting helpers.
+- Real media: `STREAMFORGE_TEST_VIDEO=<≥70 s video> cargo test -- --ignored` renders both layouts (incl. NVENC), a cover and a thumbnail, and runs loudness/scene analysis.
 
 ## Platform constraints found (verify before building each phase)
 - **Kick:** an app token (client_credentials) reads `GET /public/v1/channels?slug=`. The public API has no VOD endpoint. Webhooks (`livestream.status.updated`) need a reachable endpoint, so the app polls instead.

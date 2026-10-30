@@ -9,13 +9,26 @@ export function StreamStatus({ s }: { s: Stream["status"] }) {
     live: <Badge tone="live">● Live</Badge>,
     awaiting_file: <Badge tone="warn">Waiting for recording</Badge>,
     queued: <Badge tone="info">Queued</Badge>,
-    probed: <Badge tone="good">Ready for analysis</Badge>,
+    probed: <Badge tone="info">Imported</Badge>,
+    transcribed: <Badge tone="info">Transcribed</Badge>,
+    analyzed: <Badge tone="good">Clips found</Badge>,
     error: <Badge tone="bad">Error</Badge>,
   } as const;
   return map[s] ?? <Badge>{s}</Badge>;
 }
 
-const JOB_LABEL: Record<string, string> = { probe: "Read recording metadata" };
+const JOB_LABEL: Record<string, string> = {
+  probe: "Read recording metadata",
+  install_whisper: "Install transcription engine",
+  transcribe: "Transcribe speech",
+  analyze: "Find the best moments",
+  render: "Render clip",
+  thumbnails: "Make thumbnails",
+  publish: "Upload post",
+  refresh_stats: "Refresh analytics",
+  trend_report: "Trend report",
+  refresh_watchlist: "Refresh watchlist",
+};
 
 export function JobList({ jobs, onChange }: { jobs: Job[]; onChange: () => void }) {
   const [err, setErr] = useState<string | null>(null);
