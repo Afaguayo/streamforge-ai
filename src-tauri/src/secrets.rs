@@ -5,11 +5,18 @@ use keyring::Entry;
 
 const SERVICE: &str = "StreamForge AI";
 
-/// Only these names may be stored, so the UI cannot write arbitrary entries.
-pub const KNOWN_KEYS: &[&str] = &["kick.client_id", "kick.client_secret"];
+/// Developer-app credentials the user types in (Account Connections).
+pub const APP_KEYS: &[&str] = &[
+    "kick.client_id", "kick.client_secret",
+    "youtube.client_id", "youtube.client_secret",
+    "tiktok.client_key", "tiktok.client_secret",
+    "meta.app_id", "meta.app_secret",
+];
+/// Sign-in tokens, written only by `oauth.rs`.
+const TOKEN_KEYS: &[&str] = &["kick.token", "youtube.token", "tiktok.token", "meta.token"];
 
 fn entry(key: &str) -> Result<Entry> {
-    if !KNOWN_KEYS.contains(&key) {
+    if !APP_KEYS.contains(&key) && !TOKEN_KEYS.contains(&key) {
         return Err(anyhow!("unknown credential '{key}'"));
     }
     Ok(Entry::new(SERVICE, key)?)

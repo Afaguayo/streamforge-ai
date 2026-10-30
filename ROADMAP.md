@@ -16,7 +16,12 @@
 - [x] Recording-folder watcher with "finished writing" detection
 - [x] Recording matched to the Kick session that just ended
 - [x] Manual import, FFprobe metadata, GPU/NVENC detection
-- [ ] Kick user OAuth (PKCE) login, needed later for writing to the channel
+- [x] Kick user sign-in (OAuth 2.1 + PKCE), auto-fills the channel to monitor
+
+## Accounts ✅ (built 2026-10-29; real sign-ins need your developer apps)
+- [x] One-click browser sign-in: Kick, YouTube (Google), TikTok (desktop PKCE), Facebook + Instagram (Meta)
+- [x] Tokens in Windows Credential Manager, automatic refresh, Check / Sign in again / Disconnect
+- [x] Guided one-time developer-app setup per platform
 
 ## Phase 3 — AI clips
 - [ ] Python worker (`worker/`) with faster-whisper (CUDA, CPU fallback), word timestamps, ES/EN
@@ -33,7 +38,7 @@
 - [ ] Competitor watchlist
 
 ## Phase 5 — Publishing
-- [ ] YouTube (OAuth desktop flow, resumable upload, thumbnails)
+- [ ] YouTube resumable upload + thumbnails (sign-in already done)
 - [ ] TikTok Content Posting API (audit status shown)
 - [ ] Instagram Reels, Facebook Reels (Graph API)
 - [ ] Upload queue: review-first, retry, duplicate prevention, per-platform duration checks

@@ -16,7 +16,8 @@ The Rust core owns all state. Long-running engines are background tasks started 
 | Video Processing Engine   | `pipeline.rs` + `media.rs`    | metadata only |
 | Transcription / Moments / Clip editing | `worker/` (Python), called as jobs | Phase 3 |
 | Thumbnails / Trends / Metadata | jobs + worker            | Phase 4 |
-| Publishing / Analytics    | Rust (HTTP + OAuth)           | Phase 5–6 |
+| Account sign-in (OAuth)   | `oauth.rs`                    | built  |
+| Publishing / Analytics    | Rust (HTTP), tokens via `oauth::access_token` | Phase 5–6 |
 
 ### Job queue (`jobs.rs`)
 - Every unit of work is a row in `jobs`, so work is resumable by design. On startup, `running` → `queued`.
@@ -31,13 +32,19 @@ Local imports start at `queued`.
 
 ### Conventions
 - Database schema: append a new string to `MIGRATIONS` in `db.rs`. Never edit an existing entry.
-- Secrets: only names listed in `secrets::KNOWN_KEYS`; never log values; HTTP errors log the status, not the body.
+- Secrets: only names listed in `secrets::APP_KEYS` (plus the token names); never log values; HTTP errors log the status, not the body.
 - Child processes go through `media::hidden()` so no console windows flash.
 - UI: no button without a working action; unbuilt features render `Planned.tsx`.
 - Logs the user should see go through `db.log(level, source, message)` → Dashboard → Activity.
 
+### Sign-in (`oauth.rs`)
+- The app listens on `127.0.0.1` and `::1`, port 47821, and opens the consent page in the default browser. The browser redirects to `http://localhost:47821/callback`; the code is exchanged for tokens.
+- PKCE: Kick and Google use standard S256. TikTok desktop needs **hex**-encoded SHA-256 (sent as S256). Meta uses the client secret only, then swaps the token for a ~60-day one.
+- `oauth::access_token(provider)` returns a fresh token for uploads, refreshing it when it expires within 2 minutes. TikTok rotates refresh tokens; Google keeps the old one.
+- Token blobs are stored as `<platform>.token` in Credential Manager. The `accounts` table stores only the display name, IDs and Pages.
+
 ## Tests
-- `cd src-tauri && cargo test`: migrations, queue recovery/retry/dedupe, Kick parsing and session transitions, ingestion stability and matching, FFprobe parsing, settings.
+- `cd src-tauri && cargo test`: migrations, queue recovery/retry/dedupe, Kick parsing and session transitions, ingestion stability and matching, FFprobe parsing, settings, PKCE (RFC 7636 vector + TikTok hex), sign-in URLs, callback parsing, token refresh handling, a real loopback callback.
 - `npm test`: formatting helpers.
 
 ## Platform constraints found (verify before building each phase)

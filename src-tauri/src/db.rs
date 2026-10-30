@@ -57,6 +57,19 @@ const MIGRATIONS: &[&str] = &[
         message TEXT NOT NULL
     );
     "#,
+    // 2: connected social accounts (tokens themselves live in Credential Manager)
+    r#"
+    CREATE TABLE accounts (
+        platform      TEXT PRIMARY KEY,           -- kick | youtube | tiktok | meta
+        display_name  TEXT NOT NULL,
+        account_id    TEXT,
+        details       TEXT NOT NULL DEFAULT '{}', -- e.g. Kick slug, Facebook Pages + Instagram accounts
+        connected_at  TEXT NOT NULL,
+        expires_at    TEXT,                       -- when sign-in must be redone; NULL = unknown/none
+        last_check    TEXT,
+        last_error    TEXT
+    );
+    "#,
 ];
 
 pub struct Db(Mutex<Connection>);

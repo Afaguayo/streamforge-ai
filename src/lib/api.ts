@@ -71,6 +71,27 @@ export type Settings = {
 
 export type Toolchain = { ffmpeg: string | null; ffprobe: string | null; nvenc: boolean; gpu: string | null };
 
+export type Account = {
+  platform: string;
+  display_name: string;
+  account_id: string | null;
+  details: Record<string, unknown>;
+  connected_at: string;
+  expires_at: string | null;
+  last_check: string | null;
+  last_error: string | null;
+};
+
+export type Platform = {
+  id: "kick" | "youtube" | "tiktok" | "meta";
+  name: string;
+  redirect_uri: string;
+  id_key: string;
+  secret_key: string;
+  keys_set: boolean;
+  account: Account | null;
+};
+
 export const api = {
   overview: () => invoke<Overview>("get_overview"),
   streams: () => invoke<Stream[]>("list_streams"),
@@ -88,6 +109,11 @@ export const api = {
   testKick: () => invoke<string>("test_kick"),
   toolchain: () => invoke<Toolchain>("detect_toolchain"),
   dataDir: () => invoke<string>("data_dir"),
+  platforms: () => invoke<Platform[]>("list_platforms"),
+  signIn: (platform: string) => invoke<string>("sign_in", { platform }),
+  cancelSignIn: () => invoke<void>("cancel_sign_in"),
+  checkAccount: (platform: string) => invoke<string>("check_account", { platform }),
+  disconnect: (platform: string) => invoke<void>("disconnect_account", { platform }),
 };
 
 export const errorText = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e));

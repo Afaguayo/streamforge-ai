@@ -5,7 +5,7 @@ use crate::{
     ingest,
     jobs::{Job, JobCounts},
     kick::{KickClient, KickState},
-    media, secrets,
+    media, oauth, secrets,
     settings::Settings,
     AppState,
 };
@@ -96,11 +96,14 @@ pub fn save_settings(st: State<AppState>, settings: Settings) -> Res<Settings> {
 /// Which credentials are stored (never their values).
 #[tauri::command]
 pub fn secret_status() -> HashMap<String, bool> {
-    secrets::KNOWN_KEYS.iter().map(|k| (k.to_string(), secrets::is_set(k))).collect()
+    secrets::APP_KEYS.iter().map(|k| (k.to_string(), secrets::is_set(k))).collect()
 }
 
 #[tauri::command]
 pub fn set_secret(st: State<AppState>, key: String, value: String) -> Res<()> {
+    if !secrets::APP_KEYS.contains(&key.as_str()) {
+        return Err(format!("'{key}' can't be set from the app"));
+    }
     secrets::set(&key, &value).map_err(e)?;
     st.kick_client.forget_token();
     st.db.log("info", "credentials", &format!("Saved {key} to Windows Credential Manager"));
@@ -109,6 +112,9 @@ pub fn set_secret(st: State<AppState>, key: String, value: String) -> Res<()> {
 
 #[tauri::command]
 pub fn clear_secret(st: State<AppState>, key: String) -> Res<()> {
+    if !secrets::APP_KEYS.contains(&key.as_str()) {
+        return Err(format!("'{key}' can't be removed from here"));
+    }
     secrets::clear(&key).map_err(e)?;
     st.kick_client.forget_token();
     st.db.log("info", "credentials", &format!("Removed {key}"));
@@ -138,4 +144,68 @@ pub async fn detect_toolchain() -> media::Toolchain {
 #[tauri::command]
 pub fn data_dir(st: State<AppState>) -> String {
     st.data_dir.to_string_lossy().to_string()
+}
+
+#[derive(Serialize)]
+pub struct Platform {
+    id: &'static str,
+    name: &'static str,
+    redirect_uri: String,
+    id_key: &'static str,
+    secret_key: &'static str,
+    keys_set: bool,
+    account: Option<oauth::Account>,
+}
+
+#[tauri::command]
+pub fn list_platforms(st: State<AppState>) -> Res<Vec<Platform>> {
+    let mut accounts = oauth::list_accounts(&st.db).map_err(e)?;
+    Ok(oauth::PROVIDERS
+        .iter()
+        .map(|p| Platform {
+            id: p.id,
+            name: p.name,
+            redirect_uri: oauth::redirect_uri(),
+            id_key: p.id_key,
+            secret_key: p.secret_key,
+            keys_set: secrets::is_set(p.id_key) && secrets::is_set(p.secret_key),
+            account: accounts.iter().position(|a| a.platform == p.id).map(|i| accounts.remove(i)),
+        })
+        .collect())
+}
+
+/// Opens the browser for consent and waits (up to 5 min) for the redirect.
+#[tauri::command]
+pub async fn sign_in(app: tauri::AppHandle, st: State<'_, AppState>, platform: String) -> Res<String> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = oauth::provider(&platform).map_err(e)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Some(old) = st.sign_in_cancel.lock().unwrap().replace(tx) {
+        let _ = old.send(());
+    }
+    let open = |url: String| app.opener().open_url(url, None::<&str>).map_err(|err| anyhow::anyhow!("couldn't open the browser: {err}"));
+    let result = oauth::sign_in(&st.db, p, open, rx).await;
+    if let Err(err) = &result {
+        st.db.log("warn", "accounts", &format!("{} sign-in failed: {err:#}", p.name));
+    }
+    result.map_err(e)
+}
+
+#[tauri::command]
+pub fn cancel_sign_in(st: State<AppState>) {
+    if let Some(tx) = st.sign_in_cancel.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+}
+
+#[tauri::command]
+pub async fn check_account(st: State<'_, AppState>, platform: String) -> Res<String> {
+    let p = oauth::provider(&platform).map_err(e)?;
+    oauth::check(&st.db, p).await.map_err(e)
+}
+
+#[tauri::command]
+pub fn disconnect_account(st: State<AppState>, platform: String) -> Res<()> {
+    let p = oauth::provider(&platform).map_err(e)?;
+    oauth::disconnect(&st.db, p).map_err(e)
 }

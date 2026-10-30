@@ -4,6 +4,7 @@ mod ingest;
 mod jobs;
 mod kick;
 mod media;
+mod oauth;
 mod pipeline;
 mod secrets;
 mod settings;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub kick: Arc<Mutex<kick::KickState>>,
     pub kick_client: Arc<kick::KickClient>,
     pub data_dir: PathBuf,
+    /// Cancels the sign-in currently waiting for the browser, if any.
+    pub sign_in_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -50,7 +53,7 @@ pub fn run() {
             tauri::async_runtime::spawn(ingest::watch_loop(db.clone()));
             tauri::async_runtime::spawn(pipeline::worker_loop(db.clone(), kick_state.clone()));
 
-            app.manage(AppState { db, kick: kick_state, kick_client, data_dir });
+            app.manage(AppState { db, kick: kick_state, kick_client, data_dir, sign_in_cancel: Mutex::new(None) });
 
             // System tray: closing the window keeps the app running in the background.
             let show = MenuItem::with_id(app, "show", "Open StreamForge AI", true, None::<&str>)?;
@@ -97,6 +100,11 @@ pub fn run() {
             commands::test_kick,
             commands::detect_toolchain,
             commands::data_dir,
+            commands::list_platforms,
+            commands::sign_in,
+            commands::cancel_sign_in,
+            commands::check_account,
+            commands::disconnect_account,
         ])
         .run(tauri::generate_context!())
         .expect("error while running StreamForge AI");
