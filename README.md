@@ -1,41 +1,63 @@
 # StreamForge AI
 
-Windows desktop app that turns Kick livestreams into YouTube videos, 60–120 s vertical clips, thumbnails and social posts.
+**Stream on Kick, and StreamForge turns each broadcast into content: YouTube uploads, 60–120 s vertical clips with subtitles, thumbnails and posts for TikTok, Instagram and Facebook.**
 
-**Status: Phase 1–2 plus account sign-in (foundation, Kick monitoring, recording ingestion, one-click sign-in for every platform).** AI clipping, thumbnails, trend research and publishing are not built yet; see [ROADMAP.md](ROADMAP.md). Pages for unbuilt features say so; nothing in the app shows mock data.
+A Windows desktop app built with Tauri 2, Rust, React, SQLite and FFmpeg.
+
+![StreamForge setup guide](docs/screenshots/setup.png)
+
+> **Status: early preview (v0.1).** The foundation works today: live detection, automatic recording import, a crash-safe processing queue, and sign-in to every platform. AI clipping, subtitles, thumbnails and publishing are being built next; see the [roadmap](ROADMAP.md). Features that aren't built yet say so in the app. Nothing shows fake data.
+
+## Download
+**[⬇ Download the latest installer](https://github.com/Afaguayo/streamforge-ai/releases/latest)** (`StreamForge.AI_<version>_x64-setup.exe`, Windows 10/11, about 4 MB)
+
+Then follow the **[setup guide](docs/SETUP.md)**. It takes about 10 minutes, and the app walks you through the same steps.
 
 ## What works today
-- Desktop app with system tray: closing the window keeps it running; quit from the tray.
-- SQLite database with a persistent job queue: jobs survive crashes and restarts, retry with backoff, and can be retried or cancelled from the UI.
-- Kick live detection through Kick's official public API, recorded as stream sessions.
-- Recording ingestion: watches your OBS recording folder, waits until a file has finished writing, matches it to the Kick session that just ended, and reads its metadata with FFprobe. Manual import also works.
-- One-click sign-in for **Kick, YouTube, TikTok and Facebook + Instagram**. The app opens your browser, you approve, and it stays connected: tokens live in Windows Credential Manager and renew automatically. A **Check** button confirms each link still works.
-- GPU detection (NVIDIA + NVENC) and a "pause heavy work while live" setting.
+| | |
+|---|---|
+| **Guided first-run setup** | A step-by-step checklist inside the app that ticks itself off as you go. |
+| **Kick live detection** | Sees when you go live and when you stop, through Kick's official API. |
+| **Automatic recording import** | Watches your OBS recording folder, waits until the file is finished, matches it to the stream that just ended, and reads its length, resolution and codecs. |
+| **One-click sign-in** | Kick, YouTube, TikTok and Facebook + Instagram. Your browser opens, you approve, and it stays connected; logins renew automatically. |
+| **Crash-safe processing queue** | Jobs survive crashes and restarts and retry on their own; you can retry or cancel from the dashboard. |
+| **Runs in the background** | Lives in the system tray, and can pause heavy work while you're live so your game and stream stay smooth. |
+| **Secure by default** | Keys and logins are stored in Windows Credential Manager, never in files or logs. |
 
-## Install
-Download `StreamForge.AI_<version>_x64-setup.exe` from the [latest release](../../releases/latest) and run it. It installs per user, with no admin rights needed.
-The installer isn't code-signed yet, so Windows SmartScreen may warn: choose **More info → Run anyway**.
+| Account connections | Video library |
+|---|---|
+| ![Account Connections](docs/screenshots/connections.png) | ![Video Library](docs/screenshots/library.png) |
+| **Settings** | |
+| ![Settings](docs/screenshots/settings.png) | |
 
-**Requires FFmpeg on PATH** (`winget install Gyan.FFmpeg`). Settings → Performance shows whether it was found.
+## How it works
+```
+ You stream on Kick ──▶ StreamForge sees you go live / offline (Kick API)
+ OBS saves the recording ──▶ StreamForge imports it when the file is finished
+                              │
+                              ▼
+        processing queue ──▶ metadata ✓ ──▶ transcription ──▶ best moments ──▶ clips + subtitles
+                                             (coming next)                         │
+                                                                                   ▼
+                                    you review ──▶ YouTube · Shorts · TikTok · Reels (coming)
+```
+Every post waits for your approval until you turn on full automation.
 
-## Setup
-1. **Settings → Recording folder:** choose the folder OBS records to (OBS → Settings → Output → Recording Path). Use MKV or MP4.
-2. **Account Connections:** for each platform, open **Developer app (one-time setup)** and follow the three steps shown, then press **Sign in with …**.
-   Every platform requires uploads to go through a developer app that you own, so you create one per platform once (about 5 minutes each).
-   The redirect URL to register is `http://localhost:47821/callback`. Signing in to Kick also fills in the channel to monitor.
-3. Stream as usual. When you go offline, the session shows "Waiting for recording". When OBS finishes writing the file, it's attached and processed.
-
-## Why there is no direct Kick VOD download
-Kick's public API (docs.kick.com) has no VOD or past-broadcast endpoint. Unofficial endpoints exist but are undocumented and break without notice, so StreamForge doesn't use them. Your local OBS recording is also higher quality than Kick's re-encoded VOD.
+## Good to know
+- **Why it needs your OBS recording:** Kick's public API has no way to download past broadcasts. Unofficial methods break without notice, so StreamForge doesn't rely on them, and your local recording is better quality anyway.
+- **Why you create a developer app per platform:** Kick, Google, TikTok and Meta only allow uploads through an app registered to you. It's free and done once; the [setup guide](docs/SETUP.md) has every click.
+- **Platform limits:**
+  - **TikTok** and **YouTube** keep API uploads private until they review your app.
+  - The **Facebook Reels** API only takes clips up to 90 seconds.
+  - **Instagram** needs a Professional account.
 
 ## Build from source
-Needs Node 20+, the Rust stable toolchain (MSVC), Visual Studio C++ Build Tools, and WebView2 (built into Windows 11).
+Requires Node 20+, Rust (stable, MSVC), the Visual Studio C++ Build Tools, and WebView2 (built into Windows 11).
 ```
 npm install
-npm run app:dev      # run in development
-npm run app:build    # release build + NSIS installer
-npm test             # frontend tests
+npm run app:dev              # run in development
+npm run app:build            # release build + installer in src-tauri/target/release/bundle/nsis
+npm test                     # frontend tests
 cd src-tauri && cargo test   # backend tests
 ```
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture and conventions.
+Architecture, conventions and the platform research are in [DEVELOPMENT.md](DEVELOPMENT.md).

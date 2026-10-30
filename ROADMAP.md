@@ -22,6 +22,7 @@
 - [x] One-click browser sign-in: Kick, YouTube (Google), TikTok (desktop PKCE), Facebook + Instagram (Meta)
 - [x] Tokens in Windows Credential Manager, automatic refresh, Check / Sign in again / Disconnect
 - [x] Guided one-time developer-app setup per platform
+- [x] First-run Setup guide (FFmpeg, recording folder, Kick, publishing accounts) that ticks steps off live (v0.1.1)
 
 ## Phase 3 — AI clips
 - [ ] Python worker (`worker/`) with faster-whisper (CUDA, CPU fallback), word timestamps, ES/EN

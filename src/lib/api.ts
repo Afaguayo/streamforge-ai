@@ -67,6 +67,7 @@ export type Settings = {
   use_gpu: boolean;
   pause_while_live: boolean;
   review_before_publish: boolean;
+  onboarded: boolean;
 };
 
 export type Toolchain = { ffmpeg: string | null; ffprobe: string | null; nvenc: boolean; gpu: string | null };

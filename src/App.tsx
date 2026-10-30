@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BarChart3,
   CalendarDays,
@@ -7,6 +7,7 @@ import {
   Film,
   Image,
   LayoutDashboard,
+  ListChecks,
   Radio,
   Settings as SettingsIcon,
   TrendingUp,
@@ -19,10 +20,12 @@ import LiveMonitor from "./pages/LiveMonitor";
 import Connections from "./pages/Connections";
 import SettingsPage from "./pages/Settings";
 import Planned from "./pages/Planned";
+import Setup from "./pages/Setup";
+import { api } from "./lib/api";
 
 export type PageId =
   | "dashboard" | "live" | "library" | "clips" | "thumbnails" | "trends"
-  | "competitors" | "calendar" | "uploads" | "analytics" | "connections" | "settings";
+  | "competitors" | "calendar" | "uploads" | "analytics" | "connections" | "settings" | "setup";
 
 const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Film }[] }[] = [
   {
@@ -58,6 +61,7 @@ const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Fil
   {
     group: "Setup",
     items: [
+      { id: "setup", label: "Setup guide", icon: ListChecks },
       { id: "connections", label: "Account Connections", icon: Cable },
       { id: "settings", label: "Settings", icon: SettingsIcon },
     ],
@@ -66,6 +70,11 @@ const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Fil
 
 export default function App() {
   const [page, setPage] = useState<PageId>("dashboard");
+
+  // First launch opens the setup wizard until it's finished or skipped.
+  useEffect(() => {
+    api.settings().then((s) => !s.onboarded && setPage("setup")).catch(() => {});
+  }, []);
 
   return (
     <div className="flex h-full">
@@ -93,7 +102,7 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.1.0 · review mode on</div>
+        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.1.1 · review mode on</div>
       </aside>
       <main className="flex-1 overflow-y-auto">
         {page === "dashboard" && <Dashboard go={setPage} />}
@@ -101,6 +110,7 @@ export default function App() {
         {page === "library" && <Library go={setPage} />}
         {page === "connections" && <Connections />}
         {page === "settings" && <SettingsPage />}
+        {page === "setup" && <Setup go={setPage} />}
         {["clips", "thumbnails", "trends", "competitors", "calendar", "uploads", "analytics"].includes(page) && <Planned page={page} />}
       </main>
     </div>

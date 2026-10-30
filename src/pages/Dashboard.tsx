@@ -23,7 +23,7 @@ export default function Dashboard({ go }: { go: (p: PageId) => void }) {
                 Setup incomplete:{" "}
                 {[!k?.configured && "connect Kick", !ov.recording_dir_set && "choose your recording folder"].filter(Boolean).join(" and ")}.
               </span>
-              <Button onClick={() => go(!k?.configured ? "connections" : "settings")}>Finish setup</Button>
+              <Button onClick={() => go("setup")}>Open setup guide</Button>
             </div>
           </Notice>
         </div>

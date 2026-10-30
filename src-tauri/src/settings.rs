@@ -22,6 +22,8 @@ pub struct Settings {
     pub pause_while_live: bool,
     /// Every post waits for manual approval. Full automation is opt-in (Phase 6).
     pub review_before_publish: bool,
+    /// The first-run setup wizard was finished or skipped.
+    pub onboarded: bool,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             use_gpu: true,
             pause_while_live: true,
             review_before_publish: true,
+            onboarded: false,
         }
     }
 }
