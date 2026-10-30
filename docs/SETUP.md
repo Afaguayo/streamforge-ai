@@ -75,10 +75,16 @@ You'll need these once publishing is built (see the [roadmap](../ROADMAP.md)), b
 Limits: until Google audits your project, uploads made through the API are private. The free quota allows about 6 uploads a day.
 
 ### TikTok (about 8 minutes)
-1. Log in at [TikTok for Developers → Manage apps](https://developers.tiktok.com/apps) and click **Connect an app**.
+1. Log in at [TikTok for Developers → Manage apps](https://developers.tiktok.com/apps) and click **Connect an app**. Fill in the app details:
+   | Field | Value |
+   |---|---|
+   | Terms of Service URL | `https://afaguayo.github.io/streamforge-ai/terms.html` |
+   | Privacy Policy URL | `https://afaguayo.github.io/streamforge-ai/privacy.html` |
+   | Platforms | tick **Desktop** |
+   | Web/Desktop URL | `https://afaguayo.github.io/streamforge-ai/` (must be `https`, so the localhost link doesn't go here) |
 2. Open the app's **Sandbox** tab, create a sandbox, and add your TikTok account under **Target users**. A sandbox works right away, without TikTok's review.
 3. Add the products **Login Kit** and **Content Posting API**.
-4. In **Login Kit**, choose platform **Desktop** and add the redirect URL `http://localhost:47821/callback`.
+4. In **Login Kit**, choose platform **Desktop** and add the redirect URI `http://localhost:47821/callback`. TikTok allows `http://localhost` redirects for Desktop.
 5. Under **Scopes**, make sure `user.info.basic`, `video.upload` and `video.publish` are on.
 6. Copy the **Client key** and **Client secret** into the TikTok card and **Sign in with TikTok**.
 

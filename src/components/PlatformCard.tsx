@@ -49,7 +49,7 @@ export const GUIDE: Record<Platform["id"], { idLabel: string; secretLabel: strin
     secretLabel: "Client secret",
     minutes: 8,
     steps: [
-      <>Log in at <Link href="https://developers.tiktok.com/apps">TikTok for Developers → Manage apps</Link> and press <K>Connect an app</K>.</>,
+      <>Log in at <Link href="https://developers.tiktok.com/apps">TikTok for Developers → Manage apps</Link> and press <K>Connect an app</K>. In the app details use Terms of Service <K>https://afaguayo.github.io/streamforge-ai/terms.html</K>, Privacy Policy <K>https://afaguayo.github.io/streamforge-ai/privacy.html</K>, tick platform <K>Desktop</K>, and Web/Desktop URL <K>https://afaguayo.github.io/streamforge-ai/</K>.</>,
       <>Open the app's <K>Sandbox</K> tab, create a sandbox and add your TikTok account under <K>Target users</K>. This works without TikTok's review.</>,
       <>Add the products <K>Login Kit</K> and <K>Content Posting API</K>. In Login Kit choose platform <K>Desktop</K> and paste the <K>redirect URL</K> shown below.</>,
       <>Under Scopes make sure <K>user.info.basic</K>, <K>video.upload</K> and <K>video.publish</K> are on, then copy the <K>Client key</K> and <K>Client secret</K> into the boxes on the right.</>,
