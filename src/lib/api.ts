@@ -85,6 +85,8 @@ export type Settings = {
   auto_upload_vod: boolean;
   vod_privacy: "private" | "unlisted" | "public";
   socials: Socials;
+  hashtags: string[];
+  cut_dead_air: boolean;
 };
 
 export type Socials = { kick: string; tiktok: string; instagram: string; x: string; discord: string };
@@ -94,6 +96,8 @@ export type KickVod = { id: string; title: string; started_at: string; duration_
 export type Engine = { status: { whisper_installed: boolean; model_installed: boolean; model: string; speakers_installed: boolean }; claude: boolean; installing: boolean; installing_speakers: boolean };
 
 export type Scores = { hook: number; entertainment: number; emotion: number; context: number; replay: number; shareability: number; trend: number; total: number };
+
+export type Line = { s: number; e: number; text: string };
 
 /// A caption word. `sp` is the speaker number within the clip, `b` means it's bleeped.
 export type Word = { s: number; e: number; t: string; sp: number; b: boolean };
@@ -111,7 +115,7 @@ export type Clip = {
   hook: string | null;
   reason: string | null;
   transcript: string | null;
-  scored_by: "heuristic" | "claude";
+  scored_by: "heuristic" | "claude" | "manual";
   status: "suggested" | "approved" | "rejected";
   render_status: "none" | "queued" | "done" | "error";
   render_path: string | null;
@@ -226,6 +230,8 @@ export const api = {
   activity: () => invoke<Activity[]>("recent_activity"),
   retryJob: (id: number) => invoke<boolean>("retry_job", { id }),
   cancelJob: (id: number) => invoke<boolean>("cancel_job", { id }),
+  clearFailedJobs: () => invoke<number>("clear_failed_jobs"),
+  deleteFailedPosts: () => invoke<number>("delete_failed_posts"),
   importFiles: (paths: string[]) => invoke<number[]>("import_files", { paths }),
   reprobe: (id: number) => invoke<number>("reprobe_stream", { id }),
   settings: () => invoke<Settings>("get_settings"),
@@ -251,6 +257,8 @@ export const api = {
   restoreClip: (id: number) => invoke<void>("restore_clip", { id }),
   editClip: (id: number, start: number, end: number, title: string, hook: string) => invoke<void>("edit_clip", { id, start, end, title, hook }),
   editClipText: (id: number, turns: string[]) => invoke<void>("edit_clip_text", { id, turns }),
+  streamTranscript: (id: number) => invoke<Line[]>("stream_transcript", { id }),
+  createClip: (streamId: number, start: number, end: number, title: string) => invoke<number>("create_clip", { streamId, start, end, title }),
   toggleBleep: (id: number, index: number) => invoke<void>("toggle_bleep", { id, index }),
   downloadClip: (id: number, dest: string) => invoke<void>("download_clip", { id, dest }),
   kickVods: () => invoke<KickVod[]>("list_kick_vods"),

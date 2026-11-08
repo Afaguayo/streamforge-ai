@@ -34,6 +34,35 @@ function ClaudeKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
   );
 }
 
+function GeminiKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string }) => void }) {
+  const [value, setValue] = useState("");
+  const [saved, setSaved] = useState<boolean | null>(null);
+  useEffect(() => { api.secretStatus().then((s) => setSaved(!!s["gemini.api_key"])); }, []);
+  const save = async () => {
+    try {
+      await api.setSecret("gemini.api_key", value.trim());
+      setValue("");
+      setSaved(true);
+      onMsg({ tone: "good", text: "Gemini API key saved to Windows Credential Manager." });
+    } catch (e) {
+      onMsg({ tone: "bad", text: errorText(e) });
+    }
+  };
+  return (
+    <Field
+      label="Gemini API key for AI thumbnails (optional)"
+      hint={saved ? "✓ Saved. Each stream gets an AI thumbnail made from its best moment, selected automatically. About 3–7 US cents per image; there's no free tier for image models." : "Gemini restyles the frame of your best moment into a thumbnail; the headline is added on top. Sends that frame to Google. Paid: about 3–7 US cents per image."}
+    >
+      <div className="flex gap-2">
+        <input type="password" className={inputCls} value={value} onChange={(e) => setValue(e.target.value)} placeholder={saved ? "••••••••••••" : "AIza…"} />
+        <Button variant="primary" disabled={!value.trim()} onClick={save}>Save</Button>
+        {saved && <Button variant="danger" onClick={async () => { await api.clearSecret("gemini.api_key"); setSaved(false); }}>Remove</Button>}
+        <Button onClick={() => openUrl("https://aistudio.google.com/apikey")}>Get a key <ExternalLink size={13} /></Button>
+      </div>
+    </Field>
+  );
+}
+
 export default function SettingsPage() {
   const [s, setS] = useState<Settings | null>(null);
   const [tools, setTools] = useState<Toolchain | null>(null);
@@ -92,6 +121,7 @@ export default function SettingsPage() {
               </select>
             </Field>
             <ClaudeKey onMsg={setMsg} />
+            <GeminiKey onMsg={setMsg} />
             <div className="flex items-center justify-between gap-4 rounded-lg bg-ink-950 px-4 py-3">
               <div className="text-sm">
                 <div className="font-medium">Speaker colors</div>
@@ -155,6 +185,10 @@ export default function SettingsPage() {
                 <option value="unlisted">Unlisted</option>
                 <option value="public">Public</option>
               </select>
+            </Field>
+            <Toggle checked={s.cut_dead_air} onChange={(v) => set({ cut_dead_air: v })} label="Cut dead air from full streams" hint="Removes stretches over 45 seconds where nobody talks and little happens (AFK, loading, queues). Your original recording isn't changed." />
+            <Field label="Hashtags for full streams" hint="Added at the end of each description, after the game's own hashtag. YouTube shows the first three above the title.">
+              <input className={inputCls} value={s.hashtags.join(" ")} onChange={(e) => set({ hashtags: e.target.value.split(/[\s,]+/) })} />
             </Field>
             <Field label="Links in YouTube descriptions" hint="A handle or a full link. Added to full streams and Shorts. Empty Kick and TikTok use your connected accounts.">
               <div className="grid grid-cols-2 gap-3">

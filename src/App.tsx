@@ -7,6 +7,7 @@ import {
   Film,
   Gauge,
   Image,
+  Scissors,
   LayoutDashboard,
   ListChecks,
   Radio,
@@ -29,11 +30,12 @@ import UploadQueue from "./pages/UploadQueue";
 import Analytics from "./pages/Analytics";
 import Setup from "./pages/Setup";
 import ProgressPage from "./pages/Progress";
+import ClipPicker from "./pages/ClipPicker";
 import { ProgressDock, useProgress } from "./components/Progress";
 import { api } from "./lib/api";
 
 export type PageId =
-  | "dashboard" | "progress" | "live" | "library" | "clips" | "thumbnails" | "trends"
+  | "dashboard" | "progress" | "live" | "library" | "clips" | "picker" | "thumbnails" | "trends"
   | "competitors" | "calendar" | "uploads" | "analytics" | "connections" | "settings" | "setup";
 
 const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Film }[] }[] = [
@@ -50,6 +52,7 @@ const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Fil
     group: "Create",
     items: [
       { id: "clips", label: "AI Clip Studio", icon: Clapperboard },
+      { id: "picker", label: "Clip Picker", icon: Scissors },
       { id: "thumbnails", label: "Thumbnail Studio", icon: Image },
     ],
   },
@@ -114,7 +117,7 @@ export default function App() {
           ))}
         </nav>
         <ProgressDock p={progress} go={setPage} />
-        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.3.0</div>
+        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.3.1</div>
       </aside>
       <main className="flex-1 overflow-y-auto">
         {page === "dashboard" && <Dashboard go={setPage} />}
@@ -125,6 +128,7 @@ export default function App() {
         {page === "settings" && <SettingsPage />}
         {page === "setup" && <Setup go={setPage} />}
         {page === "clips" && <ClipStudio go={setPage} />}
+        {page === "picker" && <ClipPicker go={setPage} />}
         {page === "thumbnails" && <Thumbnails />}
         {page === "trends" && <Trends />}
         {page === "competitors" && <Competitors />}

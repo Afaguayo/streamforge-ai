@@ -7,6 +7,42 @@ use tokio::process::Command;
 
 pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "flv", "ts", "webm"];
 
+/// Puts the app in a Windows job object that ends every process inside it when the app
+/// exits. Without it, FFmpeg and whisper keep running after the app closes (even through
+/// Quit), and the job resumed on the next launch writes the same file at the same time: that
+/// produced a corrupted 21 GB upload copy.
+#[cfg(windows)]
+pub fn end_helpers_with_app() -> Result<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain Win32 calls with a zeroed, correctly sized info struct. The job handle is
+    // left open on purpose: Windows closes it when the process ends, which ends the job.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(anyhow!("couldn't create a job object"));
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, size) == 0 {
+            return Err(anyhow!("couldn't configure the job object"));
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            return Err(anyhow!("couldn't join the job object"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn end_helpers_with_app() -> Result<()> {
+    Ok(())
+}
+
 /// A command that never flashes a console window on Windows.
 pub fn hidden(program: &str) -> Command {
     let mut c = Command::new(program);

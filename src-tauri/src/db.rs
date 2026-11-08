@@ -167,6 +167,14 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE transcripts ADD COLUMN engine INTEGER NOT NULL DEFAULT 1;  -- 2 = chunked, repeat-free
     ALTER TABLE clips ADD COLUMN words TEXT;                       -- JSON [{s,e,t,sp,b}], recording time
     "#,
+    // 5: the game or category streamed, from Kick (for hashtags)
+    r#"
+    ALTER TABLE streams ADD COLUMN category TEXT;
+    "#,
+    // 6: dead air to cut from full uploads
+    r#"
+    ALTER TABLE streams ADD COLUMN cuts TEXT;                      -- JSON [[start_s, end_s], ...]
+    "#,
 ];
 
 pub struct Db(Mutex<Connection>);

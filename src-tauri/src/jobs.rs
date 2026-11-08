@@ -162,6 +162,11 @@ impl Db {
         )? > 0)
     }
 
+    /// Removes failed and cancelled jobs from the list. Returns how many.
+    pub fn clear_failed_jobs(&self) -> Result<usize> {
+        Ok(self.conn().execute("DELETE FROM jobs WHERE status IN ('failed','cancelled')", [])?)
+    }
+
     pub fn list_jobs(&self, limit: u32) -> Result<Vec<Job>> {
         let conn = self.conn();
         let mut st = conn.prepare(&format!(
@@ -228,6 +233,21 @@ mod tests {
         assert_eq!(j.status, "failed");
         assert!(db.job_retry(j.id).unwrap());
         assert_eq!(db.list_jobs(10).unwrap()[0].status, "queued");
+    }
+
+    #[test]
+    fn clearing_failed_leaves_live_and_done_jobs() {
+        let db = Db::memory().unwrap();
+        for k in ["a", "b", "c", "d"] {
+            db.enqueue(k, None, "{}").unwrap();
+        }
+        db.conn().execute("UPDATE jobs SET status='failed' WHERE kind='a'", []).unwrap();
+        db.conn().execute("UPDATE jobs SET status='cancelled' WHERE kind='b'", []).unwrap();
+        db.conn().execute("UPDATE jobs SET status='done' WHERE kind='c'", []).unwrap();
+        assert_eq!(db.clear_failed_jobs().unwrap(), 2);
+        let left: Vec<String> = db.list_jobs(10).unwrap().into_iter().map(|j| j.kind).collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"c".to_string()) && left.contains(&"d".to_string()));
     }
 
     #[test]

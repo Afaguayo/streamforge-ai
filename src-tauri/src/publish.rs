@@ -110,20 +110,118 @@ pub async fn youtube(u: &Upload<'_>, mut progress: impl FnMut(f64)) -> Result<Pu
         note = Some("YouTube kept the video private: uploads from API projects that Google hasn't audited stay private.".into());
     }
     if let Some(thumb) = u.thumbnail.filter(|t| t.is_file()) {
-        let token = oauth::access_token(p).await?;
-        let r = http()
-            .post(format!("https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={id}"))
-            .bearer_auth(token)
-            .header("Content-Type", if thumb.extension().is_some_and(|e| e == "png") { "image/png" } else { "image/jpeg" })
-            .body(std::fs::read(thumb)?)
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            note = Some(format!("Uploaded, but the thumbnail was refused ({}). Custom thumbnails need a phone-verified channel.", err_text(r).await));
+        if let Err(e) = youtube_thumbnail(&id, thumb).await {
+            note = Some(format!("Uploaded, but {e:#}"));
         }
     }
     let url = if u.duration_s <= 180.0 { format!("https://youtube.com/shorts/{id}") } else { format!("https://youtu.be/{id}") };
     Ok(Published { remote_id: id, url, note })
+}
+
+/// Sets a video's custom thumbnail.
+pub async fn youtube_thumbnail(video_id: &str, thumb: &Path) -> Result<()> {
+    let token = oauth::access_token(oauth::provider("youtube")?).await?;
+    let r = http()
+        .post(format!("https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={video_id}"))
+        .bearer_auth(token)
+        .header("Content-Type", if thumb.extension().is_some_and(|e| e == "png") { "image/png" } else { "image/jpeg" })
+        .body(std::fs::read(thumb)?)
+        .send()
+        .await?;
+    if !r.status().is_success() {
+        bail!("the thumbnail was refused ({}). Custom thumbnails need a phone-verified channel.", err_text(r).await);
+    }
+    Ok(())
+}
+
+/// Title, description, tags and privacy of a video already on YouTube.
+pub struct VideoInfo {
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub privacy: String,
+}
+
+pub async fn youtube_get(video_id: &str) -> Result<VideoInfo> {
+    let token = oauth::access_token(oauth::provider("youtube")?).await?;
+    let resp = http()
+        .get("https://www.googleapis.com/youtube/v3/videos")
+        .query(&[("part", "snippet,status"), ("id", video_id)])
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("YouTube couldn't read the video: {}", err_text(resp).await);
+    }
+    let v: Value = resp.json().await?;
+    let item = v["items"].get(0).ok_or_else(|| anyhow!("YouTube has no video {video_id} on this channel"))?;
+    Ok(VideoInfo {
+        title: item["snippet"]["title"].as_str().unwrap_or("").into(),
+        description: item["snippet"]["description"].as_str().unwrap_or("").into(),
+        tags: item["snippet"]["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
+        privacy: item["status"]["privacyStatus"].as_str().unwrap_or("").into(),
+    })
+}
+
+/// The update request: the video's current settings with the new text and privacy. Embedding
+/// and public stats are always on.
+pub fn update_body(video_id: &str, item: &Value, title: &str, description: &str, tags: &[String], privacy: &str) -> Value {
+    let sn = &item["snippet"];
+    let st = &item["status"];
+    let mut snippet = json!({
+        "title": truncate(title, 100),
+        "description": truncate(description, 4900),
+        "tags": tags,
+        "categoryId": sn["categoryId"].as_str().unwrap_or("20"),
+    });
+    for k in ["defaultLanguage", "defaultAudioLanguage"] {
+        if let Some(v) = sn[k].as_str() {
+            snippet[k] = json!(v);
+        }
+    }
+    let mut status = json!({
+        "privacyStatus": privacy,
+        "embeddable": true,
+        "publicStatsViewable": true,
+        "selfDeclaredMadeForKids": st["selfDeclaredMadeForKids"].as_bool().or(st["madeForKids"].as_bool()).unwrap_or(false),
+    });
+    if let Some(l) = st["license"].as_str() {
+        status["license"] = json!(l);
+    }
+    json!({ "id": video_id, "snippet": snippet, "status": status })
+}
+
+/// Replaces the title, description, tags and privacy of an uploaded video, then reads it back:
+/// YouTube keeps uploads from unaudited API projects private whatever is asked, and says so
+/// only by not changing it.
+pub async fn youtube_update(video_id: &str, title: &str, description: &str, tags: &[String], privacy: &str) -> Result<VideoInfo> {
+    let token = oauth::access_token(oauth::provider("youtube")?).await?;
+    // An update resets every setting it leaves out (embedding switched off this way), so the
+    // current settings are read first and sent back with only these changes.
+    let current: Value = http()
+        .get("https://www.googleapis.com/youtube/v3/videos")
+        .query(&[("part", "snippet,status"), ("id", video_id)])
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let item = current["items"].get(0).ok_or_else(|| anyhow!("YouTube has no video {video_id} on this channel"))?;
+    let body = update_body(video_id, item, title, description, tags, privacy);
+    let resp = http()
+        .put("https://www.googleapis.com/youtube/v3/videos?part=snippet,status")
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("YouTube refused the change: {}", err_text(resp).await);
+    }
+    let now = youtube_get(video_id).await?;
+    if now.privacy != privacy {
+        bail!("YouTube kept the video {}. Uploads from API apps Google hasn't audited stay private.", now.privacy);
+    }
+    Ok(now)
 }
 
 // ---------- TikTok ----------
@@ -241,9 +339,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn updates_keep_existing_settings_and_turn_embedding_on() {
+        let item = json!({"snippet": {"title": "old", "categoryId": "24", "defaultAudioLanguage": "en", "channelId": "x"},
+            "status": {"privacyStatus": "private", "embeddable": false, "license": "creativeCommon", "madeForKids": false}});
+        let b = update_body("abc", &item, "New", "Desc", &["t".into()], "public");
+        assert_eq!(b["snippet"]["categoryId"], "24");
+        assert_eq!(b["snippet"]["defaultAudioLanguage"], "en");
+        assert!(b["snippet"].get("channelId").is_none(), "read-only fields aren't sent");
+        assert_eq!(b["status"]["embeddable"], true);
+        assert_eq!(b["status"]["license"], "creativeCommon");
+        assert_eq!(b["status"]["privacyStatus"], "public");
+    }
+
+    #[test]
     fn tiktok_chunk_plan_follows_rules() {
         assert_eq!(tiktok_chunks(3_000_000), (3_000_000, 1));
         let c = 10 * 1024 * 1024;
         assert_eq!(tiktok_chunks(c * 3 + 5), (c, 3), "remainder rides on the last chunk");
+    }
+
+    /// Live: `cargo test real_youtube_privacy -- --ignored --nocapture` with STREAMFORGE_VIDEO_ID.
+    #[tokio::test]
+    #[ignore]
+    async fn real_youtube_privacy() {
+        let Ok(id) = std::env::var("STREAMFORGE_VIDEO_ID") else { return };
+        let v = youtube_get(&id).await.unwrap();
+        println!("before: privacy={} title={:?}", v.privacy, v.title);
+        match youtube_update(&id, &v.title, &v.description, &v.tags, "public").await {
+            Ok(n) => println!("after: privacy={}", n.privacy),
+            Err(e) => println!("update result: {e:#}"),
+        }
     }
 }

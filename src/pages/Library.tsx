@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { Download, FolderOpen, Plus, RefreshCw, Sparkles, Youtube } from "lucide-react";
+import { Download, FolderOpen, Plus, RefreshCw, Scissors, Sparkles, Youtube } from "lucide-react";
+import { PICK_STREAM_KEY } from "./ClipPicker";
 import { useState } from "react";
 import type { PageId } from "../App";
 import { StreamStatus } from "../components/StreamBits";
@@ -145,6 +146,11 @@ export default function Library({ go }: { go: (p: PageId) => void }) {
                       {s.file_path && (
                         <button title="Read metadata again" className="hover:text-white" onClick={() => run(() => api.reprobe(s.id))}>
                           <RefreshCw size={15} />
+                        </button>
+                      )}
+                      {s.duration_s != null && s.file_path && (
+                        <button title="Watch and pick clips yourself" className="hover:text-white" onClick={() => { try { sessionStorage.setItem(PICK_STREAM_KEY, String(s.id)); } catch { /* opens on the first recording */ } go("picker"); }}>
+                          <Scissors size={15} />
                         </button>
                       )}
                       {s.duration_s != null && (

@@ -115,6 +115,23 @@ async fn run(ctx: &Ctx, job: &Job) -> Result<String> {
         "render" => render_clip(ctx, job).await,
         "thumbnails" => thumbnails(ctx, job).await,
         "publish" => publish_post(ctx, job).await,
+        "update_video" => {
+            let p = posts::get_post(db, payload_id(job, "post")?)?;
+            let id = p.remote_id.ok_or_else(|| anyhow!("this post has no YouTube video"))?;
+            let tags: Vec<String> = serde_json::from_str(&p.tags).unwrap_or_default();
+            // The thumbnail first: it still applies if YouTube refuses the privacy change.
+            let mut thumb_note = String::new();
+            if let Some(sid) = p.stream_id {
+                let thumb: Option<String> = db.conn().query_row("SELECT path FROM thumbnails WHERE stream_id=?1 AND selected=1", [sid], |r| r.get(0)).ok();
+                if let Some(t) = thumb.filter(|t| Path::new(t).is_file()) {
+                    if let Err(e) = publish::youtube_thumbnail(&id, Path::new(&t)).await {
+                        thumb_note = format!("; {e:#}");
+                    }
+                }
+            }
+            let v = publish::youtube_update(&id, &p.title, &p.description, &tags, &p.privacy).await?;
+            Ok(format!("Updated on YouTube ({}){thumb_note}", v.privacy))
+        }
         "refresh_stats" => research::refresh_stats(db).await,
         "trend_report" => research::trend_report(db, &Settings::load(db).trend_keywords).await,
         "refresh_watchlist" => research::refresh_watchlist(db).await,
@@ -310,6 +327,8 @@ async fn analyze(ctx: &Ctx, job: &Job) -> Result<String> {
     let scenes = analysis::scene_changes(&video).await.unwrap_or_default();
     db.job_progress(job.id, 0.7, "Scoring moments");
     let sec = analysis::features(duration, &rms, &words, &scenes);
+    let cuts = analysis::dead_spans(&sec, &words, duration);
+    db.conn().execute("UPDATE streams SET cuts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&cuts)?])?;
     let exc = analysis::excitement(&sec, &analysis::Weights::default());
     let mut cands = analysis::candidates(&sec, &exc, &words, duration, 12);
     if cands.is_empty() {
@@ -433,6 +452,9 @@ async fn render_clip(ctx: &Ctx, job: &Job) -> Result<String> {
 
 // ---------- thumbnails ----------
 
+/// Average brightness below this (0-255) counts as a dark frame.
+const DARK: f64 = 45.0;
+
 async fn thumbnails(ctx: &Ctx, job: &Job) -> Result<String> {
     let db = &ctx.db;
     let sid = job.stream_id.ok_or_else(|| anyhow!("no stream"))?;
@@ -457,15 +479,72 @@ async fn thumbnails(ctx: &Ctx, job: &Job) -> Result<String> {
         db.job_progress(job.id, rank as f64 / picks.len() as f64, "Composing thumbnails");
         let at = (start + 35.0).min(end - 1.0); // the peak sits ~35 s after the clip start
         let out = dir.join(format!("thumb_{}.png", rank + 1));
-        render::render_thumbnail(&video, at, &text, rank, &work, &out).await?;
+        // A dark frame (loading screen, fade) makes a dead thumbnail: try a little later.
+        for step in 0..4 {
+            render::render_thumbnail(&video, (at + step as f64 * 15.0).min(end - 1.0), &text, rank, &work, &out).await?;
+            if render::brightness(&out).await.map_or(true, |b| b >= DARK) {
+                break;
+            }
+        }
         db.conn().execute(
             "INSERT INTO thumbnails(stream_id,path,rank,concept,selected) VALUES(?1,?2,?3,?4,?5)",
             rusqlite::params![sid, out.to_string_lossy(), rank as i64 + 1, render::thumbnail_concepts()[rank % 3].0, (rank == 0) as i64],
         )?;
     }
+    // A stream can open on a long loading screen, darker than any retry reaches. Select the
+    // brightest concept rather than always the first.
+    let made: Vec<(i64, String)> = {
+        let conn = db.conn();
+        let mut st = conn.prepare("SELECT id,path FROM thumbnails WHERE stream_id=?1")?;
+        let rows = st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut best: Option<(i64, f64)> = None;
+    for (id, path) in &made {
+        let b = render::brightness(Path::new(path)).await.unwrap_or(0.0);
+        if best.map_or(true, |(_, x)| b > x + 5.0) {
+            best = Some((*id, b));
+        }
+    }
+    if let Some((id, _)) = best {
+        db.conn().execute("UPDATE thumbnails SET selected=(id=?1) WHERE stream_id=?2", rusqlite::params![id, sid])?;
+    }
+    let ai = if llm::gemini_available() {
+        db.job_progress(job.id, 0.9, "Making the AI thumbnail");
+        match ai_thumbnail(db, &video, picks[0], &text, &meta.title, sid, &dir, &work).await {
+            Ok(()) => " + AI thumbnail",
+            Err(e) => {
+                db.log("warn", "thumbnails", &format!("AI thumbnail skipped: {e:#}"));
+                ""
+            }
+        }
+    } else {
+        ""
+    };
     let _ = std::fs::remove_dir_all(&work);
     upload_if_set(db, sid).await;
-    Ok(format!("{} thumbnail concepts", picks.len()))
+    Ok(format!("{} thumbnail concepts{ai}", picks.len()))
+}
+
+/// Gemini restyles the strongest moment's frame; FFmpeg puts the headline on it. Becomes the
+/// selected thumbnail.
+#[allow(clippy::too_many_arguments)]
+async fn ai_thumbnail(db: &Db, video: &str, (start, end): (f64, f64), text: &str, title: &str, sid: i64, dir: &Path, work: &Path) -> Result<()> {
+    let frame = work.join("ai_frame.jpg");
+    render::plain_frame(video, (start + 35.0).min(end - 1.0), &frame).await?;
+    let category: Option<String> = db.conn().query_row("SELECT category FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
+    let png = llm::ai_thumbnail(&std::fs::read(&frame)?, category.as_deref().unwrap_or("the game"), title).await?;
+    let raw = work.join("ai_raw.png");
+    std::fs::write(&raw, png)?;
+    let out = dir.join("thumb_ai.png");
+    render::text_over_image(&raw, text, &work.join("ai_text"), &out).await?;
+    let conn = db.conn();
+    conn.execute("UPDATE thumbnails SET selected=0 WHERE stream_id=?1", [sid])?;
+    conn.execute(
+        "INSERT INTO thumbnails(stream_id,path,rank,concept,selected) VALUES(?1,?2,0,'AI image (Gemini)',1)",
+        rusqlite::params![sid, out.to_string_lossy()],
+    )?;
+    Ok(())
 }
 
 /// A problem here shows in the log and leaves the clips and thumbnails that were just made.
@@ -512,6 +591,21 @@ async fn download_vod(ctx: &Ctx, job: &Job) -> Result<String> {
 
 // ---------- publish ----------
 
+/// Stretches to cut, worked out during analysis or now for streams analysed before that.
+async fn dead_air(db: &Db, job: &Job, sid: i64, video: &str, duration: f64) -> Result<Vec<(f64, f64)>> {
+    let saved: Option<String> = db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
+    if let Some(c) = saved.and_then(|j| serde_json::from_str(&j).ok()) {
+        return Ok(c);
+    }
+    db.job_progress(job.id, 0.0, "Finding dead air");
+    let words = load_words(db, sid)?;
+    let rms = analysis::loudness_per_second(video).await?;
+    let scenes = analysis::scene_changes(video).await.unwrap_or_default();
+    let cuts = analysis::dead_spans(&analysis::features(duration, &rms, &words, &scenes), &words, duration);
+    db.conn().execute("UPDATE streams SET cuts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&cuts)?])?;
+    Ok(cuts)
+}
+
 /// Makes the bleeped copy of a full stream, if it needs one and doesn't have one yet. A stream
 /// the censor hasn't read never goes out.
 async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
@@ -523,13 +617,25 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
     }
     let hits = stream_censors(db, sid).unwrap_or_default();
     let have: Option<String> = db.conn().query_row("SELECT censored_path FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
-    if hits.is_empty() || have.is_some_and(|p| Path::new(&p).is_file()) {
+    if have.is_some_and(|p| Path::new(&p).is_file()) {
         return Ok(());
     }
     let (video, duration, _) = stream_file(db, sid)?;
+    let cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
+    if hits.is_empty() && cuts.is_empty() {
+        return Ok(());
+    }
     let out = output_dir(ctx, sid).join("full_censored.mp4");
     let jid = job.id;
-    render::censor_full_video(&video, &out, &hits, &s.censor_style, duration, |p| db.job_progress(jid, p, "Bleeping audio")).await?;
+    if cuts.is_empty() {
+        render::censor_full_video(&video, &out, &hits, &s.censor_style, duration, |p| db.job_progress(jid, p, "Bleeping audio")).await?;
+    } else {
+        db.job_progress(job.id, 0.0, "Reading keyframes");
+        let parts = render::kept_parts(duration, &cuts, &render::keyframes(&video).await?);
+        let removed = duration - parts.iter().map(|(a, b)| b - a).sum::<f64>();
+        render::edit_full_video(&video, &out, &parts, &hits, &s.censor_style, |p| db.job_progress(jid, p, "Cutting dead air and bleeping")).await?;
+        db.log("info", "publish", &format!("Cut {} of dead air from the full stream", hms(removed)));
+    }
     db.conn().execute("UPDATE streams SET censored_path=?2 WHERE id=?1", rusqlite::params![sid, out.to_string_lossy()])?;
     Ok(())
 }

@@ -12,6 +12,7 @@ pub const APP_KEYS: &[&str] = &[
     "tiktok.client_key", "tiktok.client_secret",
     "meta.app_id", "meta.app_secret",
     "llm.api_key",
+    "gemini.api_key",
 ];
 /// Sign-in tokens, written only by `oauth.rs`.
 const TOKEN_KEYS: &[&str] = &["kick.token", "youtube.token", "tiktok.token", "meta.token"];

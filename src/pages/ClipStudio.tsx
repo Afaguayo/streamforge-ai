@@ -157,7 +157,7 @@ function ClipCard({ c, refresh, notify }: { c: Clip; refresh: () => void; notify
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-ink-300">
                 <span>{duration(c.start_s)} → {duration(c.end_s)} · {duration(c.end_s - c.start_s)}</span>
                 {c.category && <Badge>{c.category}</Badge>}
-                <Badge tone={c.scored_by === "claude" ? "info" : "neutral"}>{c.scored_by === "claude" ? "rated by Claude" : "heuristic score"}</Badge>
+                <Badge tone={c.scored_by === "claude" ? "info" : c.scored_by === "manual" ? "good" : "neutral"}>{c.scored_by === "claude" ? "rated by Claude" : c.scored_by === "manual" ? "picked by you" : "heuristic score"}</Badge>
                 {c.posts.map(([p, s]) => <Badge key={p} tone={s === "published" ? "good" : "neutral"}>{p}: {s}</Badge>)}
               </div>
             </div>

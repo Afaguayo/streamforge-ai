@@ -62,6 +62,11 @@ pub fn retry_job(st: State<AppState>, id: i64) -> Res<bool> {
 }
 
 #[tauri::command]
+pub fn clear_failed_jobs(st: State<AppState>) -> Res<usize> {
+    st.db.clear_failed_jobs().map_err(e)
+}
+
+#[tauri::command]
 pub fn cancel_job(st: State<AppState>, id: i64) -> Res<bool> {
     st.db.job_cancel(id).map_err(e)
 }

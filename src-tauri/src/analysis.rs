@@ -470,6 +470,42 @@ impl Default for Weights {
     }
 }
 
+// ---------- dead air ----------
+
+/// A stretch this long with nobody talking and little going on is cut from full uploads.
+pub const DEAD_MIN: f64 = 45.0;
+/// Seconds kept at each edge of a cut, so it doesn't feel abrupt.
+const DEAD_KEEP: f64 = 3.0;
+
+/// Stretches to cut from a full stream: no speech for `DEAD_MIN` seconds, not louder than the
+/// stream usually is, and few scene changes (AFK, loading screens, queues). Quiet gameplay
+/// with action on screen stays.
+pub fn dead_spans(sec: &[Second], words: &[Word], duration: f64) -> Vec<(f64, f64)> {
+    let mut edges: Vec<(f64, f64)> = Vec::new();
+    let mut last_end = 0.0;
+    for w in words {
+        if w.s - last_end >= DEAD_MIN {
+            edges.push((last_end, w.s));
+        }
+        last_end = last_end.max(w.e);
+    }
+    if duration - last_end >= DEAD_MIN {
+        edges.push((last_end, duration));
+    }
+    edges
+        .into_iter()
+        .filter(|(a, b)| {
+            let s = slice(sec, *a, *b);
+            let n = s.len().max(1) as f64;
+            let loud = s.iter().map(|x| x.loud).sum::<f64>() / n;
+            let cuts_per_min = s.iter().map(|x| x.scene).sum::<f64>() / n * 60.0;
+            loud <= 3.0 && cuts_per_min < 3.0
+        })
+        .map(|(a, b)| (if a <= 0.0 { 0.0 } else { a + DEAD_KEEP }, if b >= duration { duration } else { b - DEAD_KEEP }))
+        .filter(|(a, b)| b - a > 1.0)
+        .collect()
+}
+
 // ---------- candidates ----------
 
 /// Moves `t` to the nearest pause (≥0.6 s without speech) within `reach` seconds, searching
@@ -505,6 +541,37 @@ pub fn retrim(own: &[Word], (old_s, old_e): (f64, f64), transcript: &[Word], sta
 /// Text for a clip, with bleeped words masked.
 pub fn words_text(words: &[Word]) -> String {
     words.iter().map(|w| if w.b { crate::censor::mask(&w.t) } else { w.t.clone() }).collect::<Vec<_>>().join(" ")
+}
+
+/// A line of the transcript for reading and searching: start, end, text.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Line {
+    pub s: f64,
+    pub e: f64,
+    pub text: String,
+}
+
+/// Groups words into readable lines: a new line after a sentence ends, a pause of a second,
+/// or 16 words.
+pub fn lines(words: &[Word]) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut count = 0;
+    for w in words {
+        let start_new = match out.last() {
+            None => true,
+            Some(l) => count >= 16 || w.s - l.e > 1.0 || l.text.ends_with(['.', '!', '?']),
+        };
+        if start_new {
+            out.push(Line { s: w.s, e: w.e, text: w.t.clone() });
+            count = 1;
+        } else if let Some(l) = out.last_mut() {
+            l.e = w.e;
+            l.text.push(' ');
+            l.text.push_str(&w.t);
+            count += 1;
+        }
+    }
+    out
 }
 
 /// Consecutive runs of one speaker, as index ranges.
@@ -688,6 +755,32 @@ mod tests {
 
     fn text(w: &[Word]) -> String {
         w.iter().map(|x| x.t.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn transcript_lines_break_at_sentences_and_pauses() {
+        let mut w = sentence(0.0, "hey what's up. we good");
+        w.extend(sentence(10.0, "later"));
+        let l = lines(&w);
+        let text: Vec<&str> = l.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(text, ["hey what's up.", "we good", "later"]);
+        assert_eq!(l[2].s, 10.0);
+    }
+
+    #[test]
+    fn long_quiet_silences_are_cut_but_action_and_talk_stay() {
+        let mut words = sentence(0.0, "hello there");
+        words.extend(sentence(100.0, "back again"));
+        words.extend(sentence(200.0, "and again"));
+        words.extend(sentence(300.0, "end"));
+        let mut sec = vec![Second::default(); 400];
+        for s in sec.iter_mut().take(300).skip(110) {
+            s.scene = 0.2; // a busy fight: 12 cuts a minute
+        }
+        let cuts = dead_spans(&sec, &words, 400.0);
+        assert_eq!(cuts.len(), 2, "{cuts:?}");
+        assert!((cuts[0].0 - 3.7).abs() < 0.01 && (cuts[0].1 - 97.0).abs() < 0.01, "{cuts:?}");
+        assert_eq!(cuts[1].1, 400.0, "silence to the end is cut to the end");
     }
 
     #[test]

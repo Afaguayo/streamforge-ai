@@ -56,6 +56,10 @@ pub struct Settings {
     pub vod_privacy: String,
     /// Links added to the end of every YouTube description.
     pub socials: Socials,
+    /// Hashtags added to every full stream description, after the game's own.
+    pub hashtags: Vec<String>,
+    /// Cut long stretches where nothing happens from full stream uploads.
+    pub cut_dead_air: bool,
 }
 
 /// Empty entries are left out of descriptions.
@@ -81,7 +85,9 @@ impl Default for Settings {
             review_before_publish: true,
             onboarded: false,
             whisper_model: "small".into(),
-            auto_render_top: 5,
+            // Every suggested clip (analysis keeps up to 12): with fewer, the rest showed up in
+            // Clip Studio as empty "not rendered" cards.
+            auto_render_top: 12,
             clip_layout: "blur".into(),
             facecam_rect: [0.70, 0.04, 0.28, 0.30],
             subtitles: true,
@@ -96,6 +102,8 @@ impl Default for Settings {
             auto_upload_vod: true,
             vod_privacy: "private".into(),
             socials: Socials::default(),
+            hashtags: vec!["#kick".into(), "#livestream".into(), "#gaming".into()],
+            cut_dead_air: true,
         }
     }
 }
@@ -120,6 +128,7 @@ impl Settings {
         if !["private", "unlisted", "public"].contains(&s.vod_privacy.as_str()) { s.vod_privacy = "private".into(); }
         if !["beep", "mute"].contains(&s.censor_style.as_str()) { s.censor_style = "beep".into(); }
         s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+        s.hashtags = s.hashtags.iter().map(|h| crate::posts::hashtag(h)).filter(|h| h.len() > 1).collect();
         s.trend_keywords = s.trend_keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(5).collect();
         s.kick_channel_slug = s.kick_channel_slug.map(|v| v.trim().trim_start_matches("https://kick.com/").trim_matches('/').to_lowercase()).filter(|v| !v.is_empty());
         db.set_setting(KEY, &serde_json::to_string(&s)?)
@@ -135,6 +144,7 @@ mod tests {
         let db = Db::memory().unwrap();
         let mut s = Settings::load(&db);
         assert!(s.review_before_publish);
+        assert_eq!(s.auto_render_top, 12, "all suggested clips render by default");
         s.kick_channel_slug = Some(" https://kick.com/MyChannel/ ".into());
         s.kick_poll_secs = 1;
         s.save(&db).unwrap();

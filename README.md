@@ -26,7 +26,8 @@ Then follow the **[setup guide](docs/SETUP.md)**. It takes about 10 minutes, and
 | **Automatic recording import** | Watches your OBS recording folder, waits until the file is finished, matches it to the stream it was written during, and reads its length, resolution and codecs. |
 | **Kick VOD downloads** | No recording for a stream? StreamForge downloads the VOD from Kick. Past VODs can be picked from a list or added by link. |
 | **Auto-censor** | Masks the N-word in transcripts and captions and bleeps it in clips and full streams. Words it misses can be bleeped by hand. |
-| **Full stream uploads** | After each stream: censored video, thumbnail, title and a description with your links go to YouTube. |
+| **Full stream uploads** | After each stream: dead air cut, censored audio, thumbnail, title and a description with your links and hashtags go to YouTube, public or private as you choose. Published videos can be edited from the app. |
+| **Clip Picker** | Watch a full recording, search what was said, mark in and out, and make your own clips next to the AI ones. |
 | **One-click sign-in** | Kick, YouTube, TikTok and Facebook + Instagram. Your browser opens, you approve, and it stays connected; logins renew automatically. |
 | **Crash-safe processing queue** | Jobs survive crashes and restarts and retry on their own; you can retry or cancel from the dashboard. |
 | **Runs in the background** | Lives in the system tray, and can pause heavy work while you're live so your game and stream stay smooth. |

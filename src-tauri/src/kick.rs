@@ -77,6 +77,9 @@ pub struct Vod {
     /// HLS playlist.
     pub source: String,
     pub thumbnail: Option<String>,
+    /// The game or category streamed, e.g. "Project Zomboid".
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Kick writes both `2026-11-06 01:47:03` and `2026-11-06T01:47:03+00:00`.
@@ -101,6 +104,7 @@ fn parse_vod(live: &Value, source: Option<&str>) -> Option<Vod> {
         duration_s: live["duration"].as_f64().unwrap_or(0.0) / 1000.0,
         source,
         thumbnail: live["thumbnail"]["src"].as_str().or(live["thumbnail"].as_str()).map(String::from),
+        category: live["categories"][0]["name"].as_str().map(String::from),
     })
 }
 
@@ -167,8 +171,8 @@ pub fn add_vod(db: &Db, v: &Vod) -> Result<i64> {
     let id = {
         let conn = db.conn();
         conn.execute(
-            "INSERT INTO streams(source,title,kick_started,kick_vod_id,vod_source,status) VALUES('kick',?1,?2,?3,?4,'downloading')",
-            rusqlite::params![v.title, v.started_at, v.id, v.source],
+            "INSERT INTO streams(source,title,kick_started,kick_vod_id,vod_source,status,category) VALUES('kick',?1,?2,?3,?4,'downloading',?5)",
+            rusqlite::params![v.title, v.started_at, v.id, v.source, v.category],
         )?;
         conn.last_insert_rowid()
     };
@@ -195,8 +199,8 @@ pub async fn find_vod(db: &Db, sid: i64, attempt: i64, slug: &str) -> Result<Str
     match match_vod(&vods, &started) {
         Some(v) => {
             db.conn().execute(
-                "UPDATE streams SET kick_vod_id=?2, vod_source=?3, status='downloading' WHERE id=?1",
-                rusqlite::params![sid, v.id, v.source],
+                "UPDATE streams SET kick_vod_id=?2, vod_source=?3, status='downloading', category=COALESCE(category, ?4) WHERE id=?1",
+                rusqlite::params![sid, v.id, v.source, v.category],
             )?;
             db.enqueue("download_vod", Some(sid), &duration_payload(v.duration_s))?;
             Ok(format!("Found the Kick VOD for {}", v.title))
@@ -309,8 +313,8 @@ fn apply(db: &Db, t: Transition, ch: &ChannelStatus) -> Result<()> {
             let auto = Settings::load(db).auto_upload_vod;
             let conn = db.conn();
             conn.execute(
-                "INSERT INTO streams(source,title,kick_started,status,auto_upload) VALUES('kick',?1,?2,'live',?3)",
-                rusqlite::params![title, ch.started_at.clone().unwrap_or_else(now_str), auto as i64],
+                "INSERT INTO streams(source,title,kick_started,status,auto_upload,category) VALUES('kick',?1,?2,'live',?3,?4)",
+                rusqlite::params![title, ch.started_at.clone().unwrap_or_else(now_str), auto as i64, ch.category],
             )?;
             let id = conn.last_insert_rowid();
             drop(conn);
@@ -397,7 +401,7 @@ mod tests {
     fn vod_json() -> Value {
         json!([
             {"id": 136250421, "session_title": "Love story 2", "start_time": "2026-11-06 01:47:03", "duration": 14785000, "is_live": false,
-             "source": "https://stream.kick.com/a/master.m3u8", "thumbnail": {"src": "https://x/t.webp"}},
+             "source": "https://stream.kick.com/a/master.m3u8", "thumbnail": {"src": "https://x/t.webp"}, "categories": [{"name": "Project Zomboid"}]},
             {"id": 3, "session_title": "Now", "start_time": "2026-11-07 01:00:00", "duration": 0, "is_live": true, "source": "https://x/l.m3u8"}
         ])
     }
@@ -410,6 +414,7 @@ mod tests {
         assert_eq!(v[0].started_at, "2026-11-06T01:47:03Z");
         assert_eq!(v[0].duration_s, 14785.0);
         assert_eq!(v[0].thumbnail.as_deref(), Some("https://x/t.webp"));
+        assert_eq!(v[0].category.as_deref(), Some("Project Zomboid"));
     }
 
     #[test]

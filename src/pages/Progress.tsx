@@ -1,7 +1,8 @@
-import { PauseCircle } from "lucide-react";
+import { PauseCircle, Trash2 } from "lucide-react";
+import { api } from "../lib/api";
 import { ProgressBar, timeLeft, type Progress as State } from "../components/Progress";
 import { JOB_LABEL, JobList } from "../components/StreamBits";
-import { Card, Empty, Notice, Page } from "../components/ui";
+import { Button, Card, Empty, Notice, Page } from "../components/ui";
 
 export default function Progress({ p }: { p: State }) {
   const { current, waiting, failed, paused } = p;
@@ -27,7 +28,11 @@ export default function Progress({ p }: { p: State }) {
             <Empty>{paused ? "Waiting to resume." : "Nothing running."}</Empty>
           )}
         </Card>
-        {failed.length > 0 && <Card title={`Failed (${failed.length})`}><JobList jobs={failed} onChange={p.refresh} /></Card>}
+        {failed.length > 0 && (
+          <Card title={`Failed (${failed.length})`} right={<Button onClick={async () => { await api.clearFailedJobs(); p.refresh(); }}><Trash2 size={14} /> Clear failed</Button>}>
+            <JobList jobs={failed} onChange={p.refresh} />
+          </Card>
+        )}
         <Card title={`Up next (${waiting.length})`}>
           {waiting.length > 0 ? <JobList jobs={waiting} onChange={p.refresh} /> : <Empty>Nothing waiting.</Empty>}
         </Card>

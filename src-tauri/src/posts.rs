@@ -202,13 +202,37 @@ pub struct StreamMeta {
     pub title: String,
     pub description: String,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub hashtags: Vec<String>,
     pub thumb_text: String,
+}
+
+/// `Project Zomboid` → `#ProjectZomboid`.
+pub fn hashtag(text: &str) -> String {
+    let words: String = text.split_whitespace().map(|w| {
+        let w: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+        let mut c = w.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    }).collect();
+    format!("#{words}")
+}
+
+/// The hashtag line for a full stream: the game, then Claude's, then the ones from Settings,
+/// without repeats. YouTube shows the first three above the title.
+pub fn hashtag_line(category: Option<&str>, own: &[String], settings: &[String]) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for h in category.map(hashtag).into_iter().chain(own.iter().map(|h| hashtag(h))).chain(settings.iter().map(|h| hashtag(h))) {
+        if h.len() > 1 && !seen.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+            seen.push(h);
+        }
+    }
+    seen.join(" ")
 }
 
 /// Written by Claude once and kept when a key is set, otherwise built from the stream title.
 pub async fn stream_meta(db: &Db, stream_id: i64) -> Result<StreamMeta> {
-    let (title, started, saved): (String, Option<String>, Option<String>) =
-        db.conn().query_row("SELECT title, kick_started, meta FROM streams WHERE id=?1", [stream_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let (title, started, saved, category): (String, Option<String>, Option<String>, Option<String>) =
+        db.conn().query_row("SELECT title, kick_started, meta, category FROM streams WHERE id=?1", [stream_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     if let Some(m) = saved.and_then(|s| serde_json::from_str(&s).ok()) {
         return Ok(m);
     }
@@ -218,9 +242,9 @@ pub async fn stream_meta(db: &Db, stream_id: i64) -> Result<StreamMeta> {
         |r| r.get(0),
     )?;
     if llm::available() && !highlights.is_empty() {
-        match llm::video_package(&title, &highlights).await {
+        match llm::video_package(&title, category.as_deref(), &highlights).await {
             Ok(p) => {
-                let m = StreamMeta { title: p.title, description: p.description, tags: p.tags, thumb_text: p.thumb_text };
+                let m = StreamMeta { title: p.title, description: p.description, tags: p.tags, hashtags: p.hashtags, thumb_text: p.thumb_text };
                 db.conn().execute("UPDATE streams SET meta=?2 WHERE id=?1", rusqlite::params![stream_id, serde_json::to_string(&m)?])?;
                 return Ok(m);
             }
@@ -228,9 +252,13 @@ pub async fn stream_meta(db: &Db, stream_id: i64) -> Result<StreamMeta> {
         }
     }
     let date = started.and_then(|t| DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.format("%B %-d, %Y").to_string());
+    let game = category.as_deref().map(|c| format!(" of {c}")).unwrap_or_default();
+    let mut tags = default_tags(db, "stream");
+    tags.extend(category.clone());
     Ok(StreamMeta {
-        description: match date { Some(d) => format!("Full stream from {d}. Streamed live on Kick."), None => "Full stream. Streamed live on Kick.".into() },
-        tags: default_tags(db, "stream"),
+        description: match date { Some(d) => format!("Full stream{game} from {d}, live on Kick."), None => format!("Full stream{game}, live on Kick.") },
+        tags,
+        hashtags: Vec::new(),
         thumb_text: crate::render::headline(&title),
         title,
     })
@@ -243,9 +271,12 @@ pub async fn draft_full_video(db: &Db, stream_id: i64) -> Result<i64> {
         bail!("this recording hasn't been read yet");
     }
     let m = stream_meta(db, stream_id).await?;
-    let privacy = Settings::load(db).vod_privacy;
+    let s = Settings::load(db);
+    let privacy = s.vod_privacy.clone();
+    let category: Option<String> = db.conn().query_row("SELECT category FROM streams WHERE id=?1", [stream_id], |r| r.get(0))?;
     // Worked out first: it needs the database, which `execute` below holds until it returns.
-    let description = with_links(db, &m.description);
+    let tags_line = hashtag_line(category.as_deref(), &m.hashtags, &s.hashtags);
+    let description = format!("{}\n\n{tags_line}", with_links(db, &m.description)).trim().to_string();
     db.conn().execute(
         "INSERT INTO posts(stream_id, platform, title, description, tags, privacy) VALUES(?1,'youtube',?2,?3,?4,?5)
          ON CONFLICT DO NOTHING",
@@ -331,13 +362,35 @@ pub fn update_post(db: &Db, id: i64, title: &str, description: &str, tags: &[Str
         bail!("invalid privacy");
     }
     let n = db.conn().execute(
-        "UPDATE posts SET title=?2, description=?3, tags=?4, privacy=?5 WHERE id=?1 AND status IN ('draft','scheduled','failed')",
+        "UPDATE posts SET title=?2, description=?3, tags=?4, privacy=?5 WHERE id=?1 AND status IN ('draft','scheduled','failed','published')",
         rusqlite::params![id, title.trim(), description, serde_json::to_string(tags)?, privacy],
     )?;
     if n == 0 {
-        bail!("published posts can't be edited here");
+        bail!("posts can't be edited while they upload");
+    }
+    // Already on YouTube: send the change there too.
+    let (status, platform): (String, String) = db.conn().query_row("SELECT status, platform FROM posts WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if status == "published" {
+        if platform != "youtube" {
+            bail!("{platform} posts can't be changed after publishing");
+        }
+        db.enqueue("update_video", None, &format!("{{\"post\":{id}}}"))?;
     }
     Ok(())
+}
+
+/// Deletes every failed post (they never reached the platform). Returns how many.
+pub fn delete_failed(db: &Db) -> Result<usize> {
+    let ids: Vec<i64> = {
+        let conn = db.conn();
+        let mut st = conn.prepare("SELECT id FROM posts WHERE status='failed'")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for id in &ids {
+        delete_post(db, *id)?;
+    }
+    Ok(ids.len())
 }
 
 pub fn delete_post(db: &Db, id: i64) -> Result<()> {
@@ -451,6 +504,50 @@ mod tests {
         let p = list_posts(&db).unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].status.as_str(), p[0].privacy.as_str()), ("scheduled", "private"));
+    }
+
+    #[test]
+    fn hashtags_from_the_game_and_settings_without_repeats() {
+        assert_eq!(hashtag("Project Zomboid"), "#ProjectZomboid");
+        assert_eq!(hashtag("#kick"), "#Kick");
+        let line = hashtag_line(Some("Project Zomboid"), &["#zombies".into(), "#ProjectZomboid".into()], &["#kick".into(), "livestream".into()]);
+        assert_eq!(line, "#ProjectZomboid #Zombies #Kick #Livestream");
+        assert_eq!(hashtag_line(None, &[], &[]), "");
+    }
+
+    #[test]
+    fn full_stream_description_has_links_then_hashtags() {
+        let db = Db::memory().unwrap();
+        db.conn().execute("INSERT INTO streams(source,title,status,duration_s,category) VALUES('kick','Love story','analyzed',100,'Project Zomboid')", []).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let id = rt.block_on(draft_full_video(&db, 1)).unwrap();
+        let d = get_post(&db, id).unwrap().description;
+        assert!(d.starts_with("Full stream of Project Zomboid"), "{d}");
+        assert!(d.trim_end().ends_with("#ProjectZomboid #Kick #Livestream #Gaming"), "{d}");
+    }
+
+    #[test]
+    fn editing_a_published_youtube_post_queues_an_update() {
+        let db = Db::memory().unwrap();
+        db.conn().execute("INSERT INTO streams(source,title,status) VALUES('local','x','analyzed')", []).unwrap();
+        db.conn().execute("INSERT INTO posts(stream_id,platform,title,status,remote_id) VALUES(1,'youtube','t','published','abc')", []).unwrap();
+        update_post(&db, 1, "New title", "d", &[], "public").unwrap();
+        let jobs = db.list_jobs(10).unwrap();
+        assert_eq!((jobs[0].kind.as_str(), jobs[0].payload.as_str()), ("update_video", "{\"post\":1}"));
+    }
+
+    #[test]
+    fn manual_clips_are_approved_and_queued_for_render() {
+        let db = Db::memory().unwrap();
+        db.conn().execute("INSERT INTO streams(source,title,status,duration_s) VALUES('local','x','analyzed',600)", []).unwrap();
+        db.conn().execute("INSERT INTO transcripts(stream_id,words,engine) VALUES(1,'[[100.0,100.4,\"hola\"],[101.0,101.3,\"n****\"],[300.0,300.3,\"later\"]]',2)", []).unwrap();
+        let id = crate::studio::create_manual_clip(&db, 1, 95.0, 125.0, "").unwrap();
+        let (status, render, by, words): (String, String, String, String) = db.conn()
+            .query_row("SELECT status,render_status,scored_by,words FROM clips WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!((status.as_str(), render.as_str(), by.as_str()), ("approved", "queued", "manual"));
+        assert!(words.contains("\"b\":true"), "the censored word stays bleeped: {words}");
+        assert!(crate::studio::create_manual_clip(&db, 1, 0.0, 2.0, "").is_err(), "too short");
+        assert!(crate::studio::create_manual_clip(&db, 1, 550.0, 650.0, "").is_err(), "past the end");
     }
 
     #[test]

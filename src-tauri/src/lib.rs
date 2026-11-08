@@ -53,6 +53,9 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let db = Arc::new(db::Db::open(&data_dir.join("streamforge.db"))?);
             let resumed = db.recover_interrupted()?;
+            if let Err(e) = media::end_helpers_with_app() {
+                db.log("warn", "app", &format!("Helpers may outlive the app: {e:#}"));
+            }
             pipeline::redo_old_transcripts(&db)?;
             db.log("info", "app", &format!("Started; {resumed} interrupted job(s) resumed"));
 
@@ -102,6 +105,7 @@ pub fn run() {
             commands::recent_activity,
             commands::retry_job,
             commands::cancel_job,
+            commands::clear_failed_jobs,
             commands::import_files,
             commands::reprobe_stream,
             commands::get_settings,
@@ -127,6 +131,8 @@ pub fn run() {
             studio::restore_clip,
             studio::edit_clip,
             studio::edit_clip_text,
+            studio::stream_transcript,
+            studio::create_clip,
             studio::toggle_bleep,
             studio::download_clip,
             studio::list_kick_vods,
@@ -141,6 +147,7 @@ pub fn run() {
             studio::schedule_post,
             studio::unschedule_post,
             studio::delete_post,
+            studio::delete_failed_posts,
             studio::draft_full_video,
             studio::analytics,
             studio::refresh_stats,

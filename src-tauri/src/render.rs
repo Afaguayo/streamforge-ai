@@ -209,7 +209,9 @@ pub async fn render_clip(j: ClipJob<'_>, progress: impl FnMut(f64)) -> Result<()
 pub async fn censor_full_video(video: &str, out: &Path, ranges: &[(f64, f64)], style: &str, dur: f64, progress: impl FnMut(f64)) -> Result<()> {
     let dir = out.parent().ok_or_else(|| anyhow!("no output folder"))?;
     std::fs::create_dir_all(dir)?;
-    let part = out.with_extension("part.mp4");
+    // A name of its own per run: if the app is force-closed mid-job, FFmpeg can keep writing
+    // its file, and a retry writing the same file interleaves the two into a broken video.
+    let part = out.with_extension(format!("{}.part.mp4", std::process::id()));
     let args: Vec<String> = vec![
         "-i".into(), video.into(), "-filter_complex".into(), censor::audio_graph("[0:a:0]", "aresample=48000,", ranges, style, dur),
         "-map".into(), "0:v:0".into(), "-map".into(), "[aout]".into(), "-c:v".into(), "copy".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "160k".into(),
@@ -218,6 +220,129 @@ pub async fn censor_full_video(video: &str, out: &Path, ranges: &[(f64, f64)], s
     run_ffmpeg(dir, &args, dur, progress).await?;
     std::fs::rename(&part, out)?;
     Ok(())
+}
+
+/// Keyframe times of the video stream, read from packets (no decoding).
+pub async fn keyframes(video: &str) -> Result<Vec<f64>> {
+    let out = hidden("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", video])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!("couldn't read keyframes: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let mut k: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (t, flags) = l.split_once(',')?;
+            flags.starts_with('K').then(|| t.parse().ok())?
+        })
+        .collect();
+    k.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Ok(k)
+}
+
+/// The parts of a video kept after `cuts`, widened to keyframes so the video can be copied
+/// without re-encoding. Widening only ever keeps a little more, never less.
+pub fn kept_parts(duration: f64, cuts: &[(f64, f64)], keys: &[f64]) -> Vec<(f64, f64)> {
+    let mut parts = Vec::new();
+    let mut at = 0.0;
+    for (a, b) in cuts {
+        if *a > at {
+            parts.push((at, *a));
+        }
+        at = at.max(*b);
+    }
+    if duration > at {
+        parts.push((at, duration));
+    }
+    let down = |t: f64| keys.iter().copied().filter(|k| *k <= t + 1e-6).last().unwrap_or(0.0);
+    let up = |t: f64| keys.iter().copied().find(|k| *k >= t - 1e-6).unwrap_or(duration);
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for (a, b) in parts {
+        let (a, b) = (down(a), if b >= duration { duration } else { up(b) });
+        match out.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ if b > a => out.push((a, b)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A time in the original video, on the timeline of the kept parts.
+pub fn remap(t: f64, parts: &[(f64, f64)]) -> Option<f64> {
+    let mut before = 0.0;
+    for (a, b) in parts {
+        if t < *a {
+            return None;
+        }
+        if t <= *b {
+            return Some(before + t - a);
+        }
+        before += b - a;
+    }
+    None
+}
+
+/// Copies only the kept parts (video untouched, audio re-encoded with any bleeps).
+pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], censors: &[(f64, f64)], style: &str, progress: impl FnMut(f64)) -> Result<()> {
+    let dir = out.parent().ok_or_else(|| anyhow!("no output folder"))?;
+    std::fs::create_dir_all(dir)?;
+    let part = out.with_extension(format!("{}.part.mp4", std::process::id()));
+    let list = out.with_extension(format!("{}.txt", std::process::id()));
+    let src = video.replace('\\', "/").replace('\'', "'\\''");
+    let mut text = String::from("ffconcat version 1.0\n");
+    for (i, (a, b)) in parts.iter().enumerate() {
+        text.push_str(&format!("file '{src}'\ninpoint {a:.3}\n"));
+        if i + 1 < parts.len() {
+            // Just before the keyframe: ending exactly on it puts that frame in both pieces,
+            // which gives two packets the same timestamp at the seam.
+            text.push_str(&format!("outpoint {:.3}\n", b - 0.001));
+        }
+    }
+    std::fs::write(&list, text)?;
+    let total: f64 = parts.iter().map(|(a, b)| b - a).sum();
+    let ranges: Vec<(f64, f64)> = censors.iter().filter_map(|(a, b)| Some((remap(*a, parts)?, remap(*b, parts).unwrap_or(remap(*a, parts)? + (b - a))))).collect();
+    let mut args: Vec<String> = vec!["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list.to_string_lossy().into()];
+    if ranges.is_empty() {
+        args.extend(["-map", "0:v:0", "-map", "0:a:0"].map(String::from));
+    } else {
+        args.extend(["-filter_complex".to_string(), censor::audio_graph("[0:a:0]", "aresample=48000,", &ranges, style, total), "-map".into(), "0:v:0".into(), "-map".into(), "[aout]".into()]);
+    }
+    args.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"].map(String::from));
+    args.push(part.to_string_lossy().into());
+    let res = run_ffmpeg(dir, &args, total, progress).await;
+    let _ = std::fs::remove_file(&list);
+    res?;
+    std::fs::rename(&part, out)?;
+    Ok(())
+}
+
+/// Headline text over a finished image (the AI thumbnail), 1280x720.
+pub async fn text_over_image(image: &Path, text: &str, work: &Path, out: &Path) -> Result<()> {
+    std::fs::create_dir_all(work)?;
+    std::fs::create_dir_all(out.parent().ok_or_else(|| anyhow!("no output folder"))?)?;
+    let (_, _, ov) = thumbnail_concepts()[1];
+    std::fs::write(work.join("subs.ass"), still_ass(1280, 720, text, "Thumb", ov))?;
+    let args: Vec<String> = vec![
+        "-i".into(), image.to_string_lossy().into(), "-frames:v".into(), "1".into(),
+        "-vf".into(), "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,subtitles=subs.ass".into(),
+        out.to_string_lossy().into(),
+    ];
+    run_ffmpeg(work, &args, 0.0, |_| {}).await
+}
+
+/// One plain 1280x720 frame (no text), the input for an AI thumbnail.
+pub async fn plain_frame(video: &str, at: f64, out: &Path) -> Result<()> {
+    let dir = out.parent().ok_or_else(|| anyhow!("no output folder"))?;
+    std::fs::create_dir_all(dir)?;
+    let args: Vec<String> = vec![
+        "-ss".into(), format!("{:.3}", (at - 2.0).max(0.0)), "-t".into(), "4".into(), "-i".into(), video.into(), "-frames:v".into(), "1".into(),
+        "-vf".into(), "fps=15,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,thumbnail=50".into(), "-q:v".into(), "2".into(),
+        out.to_string_lossy().into(),
+    ];
+    run_ffmpeg(dir, &args, 0.0, |_| {}).await
 }
 
 /// One frame at `at`, laid out like the clip, with the hook in large type.
@@ -230,6 +355,20 @@ pub async fn render_cover(video: &str, at: f64, text: &str, layout: &Layout, wor
         "-filter_complex".into(), vertical_graph(layout, true), "-map".into(), "[out]".into(), "-q:v".into(), "3".into(), out.to_string_lossy().into(),
     ];
     run_ffmpeg(work, &args, 0.0, |_| {}).await
+}
+
+/// Average brightness (0-255) of an image. Loading screens and fades come out near black.
+pub async fn brightness(image: &Path) -> Result<f64> {
+    let out = hidden("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(image)
+        .args(["-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"])
+        .output()
+        .await?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.split("YAVG=").nth(1)?.trim().parse().ok())
+        .ok_or_else(|| anyhow!("couldn't measure brightness"))
 }
 
 /// Three thumbnail concepts, each a different composition of a strong frame + headline.
@@ -344,6 +483,21 @@ mod tests {
     }
 
     #[test]
+    fn kept_parts_skip_cuts_and_widen_to_keyframes() {
+        let keys: Vec<f64> = (0..=50).map(|i| i as f64 * 2.0).collect();
+        let parts = kept_parts(100.0, &[(10.5, 40.5), (95.0, 100.0)], &keys);
+        assert_eq!(parts, vec![(0.0, 12.0), (40.0, 96.0)], "kept more, never less");
+        assert_eq!(remap(5.0, &parts), Some(5.0));
+        assert_eq!(remap(20.0, &parts), None, "inside a cut");
+        assert_eq!(remap(50.0, &parts), Some(22.0));
+    }
+
+    #[test]
+    fn no_cuts_keeps_everything() {
+        assert_eq!(kept_parts(30.0, &[], &[0.0, 10.0, 20.0]), vec![(0.0, 30.0)]);
+    }
+
+    #[test]
     fn graphs_end_in_out_label() {
         let blur = Layout { kind: "blur".into(), facecam: [0.0; 4] };
         let cam = Layout { kind: "facecam".into(), facecam: [0.7, 0.04, 0.28, 0.3] };
@@ -397,9 +551,19 @@ mod ffmpeg_tests {
         assert_eq!(probe_dims(&cover).await.0, 1080);
         let thumb = dir.path().join("thumb.png");
         render_thumbnail(&v, 20.0, "BIG MOMENT", 1, &dir.path().join("t"), &thumb).await.unwrap();
+        assert!(brightness(&thumb).await.unwrap() > 40.0, "test pattern is bright");
         let nested = dir.path().join("not").join("made").join("thumb.png");
         render_thumbnail(&v, 20.0, "BIG MOMENT", 0, &dir.path().join("t2"), &nested).await.unwrap();
         assert_eq!(probe_dims(&thumb).await.0, 1280);
+        let keys = keyframes(&v).await.unwrap();
+        assert!(keys.len() > 2, "keyframes read");
+        let parts = kept_parts(90.0, &[(20.0, 60.0)], &keys);
+        let edited = dir.path().join("edited.mp4");
+        edit_full_video(&v, &edited, &parts, &[(65.0, 66.0)], "beep", |_| {}).await.unwrap();
+        let (_, _, d) = probe_dims(&edited).await;
+        let expected: f64 = parts.iter().map(|(a, b)| b - a).sum();
+        assert!((d - expected).abs() < 1.0, "edited length {d} vs {expected}");
+        assert!(d < 60.0, "the cut came out: {d}");
         let rms = crate::analysis::loudness_per_second(&v).await.unwrap();
         assert!(rms.len() >= 85, "one value per second: {}", rms.len());
         let loud: f64 = rms[40..48].iter().sum::<f64>() / 8.0;
@@ -466,5 +630,29 @@ mod real_censor_tests {
         }
         render_thumbnail(&v, 20.0, "PROJECTS ZOMBOID LOVE STORY", 0, &keep.join("t"), &keep.join("thumb0.png")).await.unwrap();
         render_thumbnail(&v, 40.0, "PROJECTS ZOMBOID LOVE STORY", 2, &keep.join("t"), &keep.join("thumb2.png")).await.unwrap();
+    }
+}
+
+/// Cutting a real recording: `cargo test real_edit -- --ignored --nocapture` with
+/// STREAMFORGE_EDIT_VIDEO (6+ minutes) and STREAMFORGE_KEEP.
+#[cfg(test)]
+mod real_edit_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_edit_cuts_and_stays_in_sync() {
+        let (Ok(v), Ok(k)) = (std::env::var("STREAMFORGE_EDIT_VIDEO"), std::env::var("STREAMFORGE_KEEP")) else { return };
+        let dur = crate::media::probe(&v).await.unwrap().duration_s.unwrap();
+        let parts = kept_parts(dur, &[(61.3, 179.1)], &keyframes(&v).await.unwrap());
+        println!("parts {parts:?}");
+        let out = PathBuf::from(k).join("edited.mp4");
+        edit_full_video(&v, &out, &parts, &[(200.0, 200.6)], "beep", |_| {}).await.unwrap();
+        let o = hidden("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0"]).arg(&out).output().await.unwrap();
+        println!("streams: {}", String::from_utf8_lossy(&o.stdout).trim().replace('\n', " | "));
+        let expected: f64 = parts.iter().map(|(a, b)| b - a).sum();
+        let got = crate::media::probe(&out.to_string_lossy()).await.unwrap().duration_s.unwrap();
+        println!("expected {expected:.2} got {got:.2}");
+        assert!((got - expected).abs() < 0.5);
     }
 }

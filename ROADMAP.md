@@ -56,6 +56,14 @@
 - [x] Clip download, caption editing, 5–180 s manual trims
 - [x] Speaker colors in captions and transcript (optional sherpa-onnx install)
 
+## v0.3.1 — Editing, public uploads, Clip Picker
+- [x] Clip Picker: watch a full recording, search the transcript, mark in/out, make your own clips
+- [x] Dead air cut from full stream uploads (keyframe-snapped copy, no re-encode)
+- [x] Public uploads, hashtags led by the game (Kick category), editable published videos (title, description, privacy, thumbnail)
+- [x] All suggested clips render; brightest thumbnail selected; Clear failed buttons
+- [x] FFmpeg/whisper helpers end with the app (Windows job object)
+- [ ] AI thumbnails with Gemini (built, needs a key to test)
+
 ## Phase 7 — Hardening
 - [x] Disk-space monitor (pauses below 2 GB), temp-file cleanup
 - [ ] Auto-update (Tauri updater + signed releases)

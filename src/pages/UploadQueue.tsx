@@ -16,7 +16,10 @@ export const toLocalInput = (iso: string) => {
 export const fromLocalInput = (v: string) => new Date(v).toISOString();
 
 function PostCard({ p, refresh, notify }: { p: Post; refresh: () => void; notify: (m: string, bad?: boolean) => void }) {
-  const editable = ["draft", "scheduled", "failed"].includes(p.status);
+  const [editingLive, setEditingLive] = useState(false);
+  const published = p.status === "published";
+  // Published YouTube videos can be edited too: the change is sent to YouTube.
+  const editable = ["draft", "scheduled", "failed"].includes(p.status) || (published && p.platform === "youtube" && editingLive);
   const [title, setTitle] = useState(p.title);
   const [desc, setDesc] = useState(p.description);
   const [tags, setTags] = useState((JSON.parse(p.tags) as string[]).join(", "));
@@ -64,9 +67,15 @@ function PostCard({ p, refresh, notify }: { p: Post; refresh: () => void; notify
                     <option value="public">Public</option>
                   </select>
                 </Field>
-                <Field label="Schedule (your time)"><input type="datetime-local" className={inputCls} value={when} onChange={(e) => setWhen(e.target.value)} /></Field>
+                {!published && <Field label="Schedule (your time)"><input type="datetime-local" className={inputCls} value={when} onChange={(e) => setWhen(e.target.value)} /></Field>}
               </div>
               {p.error && <Notice tone={p.status === "failed" ? "bad" : "warn"}>{p.error}</Notice>}
+              {published ? (
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="primary" disabled={!dirty} onClick={() => run(async () => setEditingLive(false), "Saved. Sending the change to YouTube; it shows on the Progress page.")}><Send size={14} /> Save to YouTube</Button>
+                  <Button onClick={() => setEditingLive(false)}>Cancel</Button>
+                </div>
+              ) : (
               <div className="flex flex-wrap gap-2">
                 <Button variant="primary" onClick={() => run(() => api.schedulePost(p.id, null), "Uploading now. Progress shows here.")}><Send size={14} /> Publish now</Button>
                 <Button disabled={!when} onClick={() => run(() => api.schedulePost(p.id, fromLocalInput(when)), "Scheduled.")}><CalendarClock size={14} /> {p.status === "scheduled" ? "Reschedule" : "Schedule"}</Button>
@@ -74,6 +83,7 @@ function PostCard({ p, refresh, notify }: { p: Post; refresh: () => void; notify
                 {p.status === "scheduled" && <Button onClick={() => run(() => api.unschedulePost(p.id), "Moved back to drafts.")}><Undo2 size={14} /> Unschedule</Button>}
                 <Button variant="danger" onClick={() => run(() => api.deletePost(p.id), "Draft deleted.")}><Trash2 size={14} /> Delete</Button>
               </div>
+              )}
             </>
           ) : (
             <>
@@ -85,6 +95,7 @@ function PostCard({ p, refresh, notify }: { p: Post; refresh: () => void; notify
                 <div className="flex items-center gap-5 text-sm text-ink-300">
                   {p.views != null ? <span>{p.views.toLocaleString()} views · {p.likes ?? 0} likes · {p.comments ?? 0} comments</span> : <span>Stats appear after the next refresh</span>}
                   {p.url && <button className="inline-flex items-center gap-1 text-sky-300 hover:underline" onClick={() => openUrl(p.url!)}>Open <ExternalLink size={12} /></button>}
+                  {p.platform === "youtube" && <button className="text-sky-300 hover:underline" onClick={() => setEditingLive(true)}>Edit title, description or privacy</button>}
                 </div>
               )}
               {p.error && <Notice tone="warn">{p.error}</Notice>}
@@ -113,6 +124,13 @@ export default function UploadQueue() {
           </button>
         ))}
       </div>
+      {tab === "failed" && count("failed") > 0 && (
+        <div className="mb-4">
+          <Button variant="danger" onClick={async () => {
+            try { const n = await api.deleteFailedPosts(); setMsg({ text: `Deleted ${n} failed post(s).` }); refresh(); } catch (e) { setMsg({ text: errorText(e), bad: true }); }
+          }}><Trash2 size={14} /> Delete all failed</Button>
+        </div>
+      )}
       <div className="space-y-4">
         {shown.length === 0 ? <Empty>Nothing here.</Empty> : shown.map((p) => <PostCard key={`${p.id}-${p.status}`} p={p} refresh={refresh} notify={(text, bad) => setMsg({ text, bad })} />)}
       </div>

@@ -125,23 +125,26 @@ pub struct VideoPackage {
     pub title: String,
     pub description: String,
     pub tags: Vec<String>,
+    pub hashtags: Vec<String>,
     pub thumb_text: String,
 }
 
 /// Title, description, tags and thumbnail wording for a full stream upload.
-pub async fn video_package(stream_title: &str, highlights: &str) -> Result<VideoPackage> {
+pub async fn video_package(stream_title: &str, category: Option<&str>, highlights: &str) -> Result<VideoPackage> {
     let system = "You package a livestreamer's full stream for YouTube. Sound like a person, not an AI: no 'Dive into', no emoji spam, \
 no keyword stuffing, no claims the highlights don't support. Use the highlights' language. \
-title: specific and curiosity-driven, built on what actually happened, under 70 characters, no hashtags. \
+title: catchy and curiosity-driven, built on a real moment from the highlights (a quote, a fail, a twist), under 70 characters, no hashtags. \
 description: 2-3 short paragraphs on what happens. Don't add links or a call to follow, they're added later. \
-tags: 8-15 search tags without #. \
+tags: 8-15 search tags without #. hashtags: 3-5 hashtags with #, the game first, no spaces inside a hashtag. \
 thumb_text: 2 to 4 punchy words for the thumbnail, different from the title. \
 Text with stars is censored: never spell out or hint at a censored word.";
-    let user = format!("Stream title on Kick: {stream_title}\nHighlights from the transcript:\n{highlights}");
-    let schema = json!({ "type": "object", "additionalProperties": false, "required": ["title","description","tags","thumb_text"],
-        "properties": { "title": {"type":"string"}, "description": {"type":"string"}, "tags": {"type":"array","items":{"type":"string"}}, "thumb_text": {"type":"string"} } });
+    let user = format!("Stream title on Kick: {stream_title}\nGame: {}\nHighlights from the transcript:\n{highlights}", category.unwrap_or("unknown"));
+    let schema = json!({ "type": "object", "additionalProperties": false, "required": ["title","description","tags","hashtags","thumb_text"],
+        "properties": { "title": {"type":"string"}, "description": {"type":"string"}, "tags": {"type":"array","items":{"type":"string"}},
+            "hashtags": {"type":"array","items":{"type":"string"}}, "thumb_text": {"type":"string"} } });
     let v = call_json(system, &user, schema).await?;
     Ok(VideoPackage {
+        hashtags: v["hashtags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
         title: v["title"].as_str().unwrap_or(stream_title).into(),
         description: v["description"].as_str().unwrap_or("").into(),
         tags: v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
@@ -168,4 +171,87 @@ no keyword stuffing, no claims the video doesn't support. Use the transcript's l
         description: v["description"].as_str().unwrap_or("").into(),
         tags: v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
     })
+}
+
+// ---------- AI thumbnails (Gemini) ----------
+
+const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/interactions";
+const GEMINI_IMAGE_MODEL: &str = "gemini-nano-banana-2.1";
+
+pub fn gemini_available() -> bool {
+    secrets::is_set("gemini.api_key")
+}
+
+/// Finds the first base64 image in a Gemini answer. Walks the whole answer, so both the
+/// Interactions shape (`steps[].content[]` with `type: image` and `data`) and the older
+/// `generateContent` shape (`inlineData.data`) work.
+pub fn find_image(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(m) => {
+            if m.get("type").and_then(|t| t.as_str()) == Some("image") {
+                if let Some(d) = m.get("data").and_then(|d| d.as_str()) {
+                    return Some(d.to_string());
+                }
+            }
+            if let Some(d) = m.get("inlineData").or_else(|| m.get("inline_data")).and_then(|i| i["data"].as_str()) {
+                return Some(d.to_string());
+            }
+            m.values().find_map(find_image)
+        }
+        Value::Array(a) => a.iter().find_map(find_image),
+        _ => None,
+    }
+}
+
+/// Turns a stream frame into a thumbnail-style image: the same scene and streamer, punched up.
+/// The headline is added afterwards by FFmpeg, because image models misspell text.
+pub async fn ai_thumbnail(frame_jpg: &[u8], game: &str, moment: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let key = secrets::get("gemini.api_key")?.ok_or_else(|| anyhow!("no Gemini API key saved"))?;
+    let prompt = format!(
+        "Turn this livestream screenshot into an eye-catching YouTube gaming thumbnail like top creators use. \
+Keep the streamer from the webcam recognizable, make them large and expressive in the right half. \
+Keep the game ({game}) recognizable with dramatic lighting, saturated colors, high contrast and sharp detail. \
+The moment: {moment}. Leave the left third calm and darker for a headline. \
+Do not add any text, letters, numbers, logos, borders or watermarks."
+    );
+    let b64 = base64::engine::general_purpose::STANDARD.encode(frame_jpg);
+    let body = json!({
+        "model": GEMINI_IMAGE_MODEL,
+        "input": [
+            { "type": "image", "mime_type": "image/jpeg", "data": b64 },
+            { "type": "text", "text": prompt },
+        ],
+        "response_format": { "type": "image", "aspect_ratio": "16:9", "mime_type": "image/png" },
+    });
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()?
+        .post(GEMINI_URL)
+        .header("x-goog-api-key", key)
+        .json(&body)
+        .send()
+        .await
+        .context("couldn't reach the Gemini API")?;
+    let status = resp.status();
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(anyhow!("Gemini API error ({status}): {}", v["error"]["message"].as_str().unwrap_or("")));
+    }
+    let data = find_image(&v).ok_or_else(|| anyhow!("Gemini returned no image"))?;
+    Ok(base64::engine::general_purpose::STANDARD.decode(data.trim())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_images_in_both_answer_shapes() {
+        let interactions = json!({"steps": [{"type": "thought"}, {"type": "model_output", "content": [{"type": "text", "text": "ok"}, {"type": "image", "data": "QUJD"}]}]});
+        assert_eq!(find_image(&interactions).as_deref(), Some("QUJD"));
+        let legacy = json!({"candidates": [{"content": {"parts": [{"text": "x"}, {"inlineData": {"mimeType": "image/png", "data": "REVG"}}]}}]});
+        assert_eq!(find_image(&legacy).as_deref(), Some("REVG"));
+        assert_eq!(find_image(&json!({"steps": []})), None);
+    }
 }

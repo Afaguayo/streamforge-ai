@@ -172,6 +172,42 @@ pub fn toggle_bleep(st: State<AppState>, id: i64, index: usize) -> Res<()> {
     pipeline::save_clip_words(&st.db, id, &words).map_err(e)
 }
 
+/// The recording's transcript as readable lines, for the Clip Picker.
+#[tauri::command]
+pub fn stream_transcript(st: State<AppState>, id: i64) -> Res<Vec<analysis::Line>> {
+    Ok(analysis::lines(&pipeline::load_words(&st.db, id).map_err(e)?))
+}
+
+/// A clip you picked yourself: approved straight away and rendered.
+#[tauri::command]
+pub fn create_clip(st: State<AppState>, stream_id: i64, start: f64, end: f64, title: String) -> Res<i64> {
+    create_manual_clip(&st.db, stream_id, start, end, &title).map_err(e)
+}
+
+pub fn create_manual_clip(db: &crate::db::Db, stream_id: i64, start: f64, end: f64, title: &str) -> anyhow::Result<i64> {
+    let len = end - start;
+    if !(EDIT_MIN - 0.01..=EDIT_MAX + 0.01).contains(&len) || start < 0.0 {
+        anyhow::bail!("clips can be {EDIT_MIN:.0}–{EDIT_MAX:.0} s long (this would be {len:.0} s)");
+    }
+    let dur: Option<f64> = db.conn().query_row("SELECT duration_s FROM streams WHERE id=?1", [stream_id], |r| r.get(0))?;
+    if dur.is_some_and(|d| end > d + 0.5) {
+        anyhow::bail!("the clip can't end after the recording does");
+    }
+    let words = analysis::slice_words(&pipeline::load_words(db, stream_id).unwrap_or_default(), start, end);
+    let title = if title.trim().is_empty() { analysis::auto_title(&words, start + len / 2.0) } else { title.trim().to_string() };
+    let id = {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO clips(stream_id,start_s,end_s,score,category,title,transcript,scored_by,status,words)
+             VALUES(?1,?2,?3,100,'moment',?4,?5,'manual','approved',?6)",
+            rusqlite::params![stream_id, start, end, title, analysis::words_text(&words), serde_json::to_string(&words)?],
+        )?;
+        conn.last_insert_rowid()
+    };
+    posts::queue_render(db, id)?;
+    Ok(id)
+}
+
 /// Copies a finished clip to where you chose.
 #[tauri::command]
 pub fn download_clip(st: State<AppState>, id: i64, dest: String) -> Res<()> {
@@ -281,6 +317,11 @@ pub fn schedule_post(st: State<AppState>, id: i64, at: Option<String>) -> Res<()
 #[tauri::command]
 pub fn unschedule_post(st: State<AppState>, id: i64) -> Res<()> {
     posts::unschedule(&st.db, id).map_err(e)
+}
+
+#[tauri::command]
+pub fn delete_failed_posts(st: State<AppState>) -> Res<usize> {
+    posts::delete_failed(&st.db).map_err(e)
 }
 
 #[tauri::command]

@@ -58,8 +58,8 @@ pub fn adopt_recording(db: &Db, session: i64) -> Result<Option<i64>> {
     let conn = db.conn();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "UPDATE streams SET source='kick', title=s.title, kick_started=s.kick_started, kick_ended=s.kick_ended, auto_upload=s.auto_upload
-         FROM (SELECT title,kick_started,kick_ended,auto_upload FROM streams WHERE id=?2) s WHERE streams.id=?1",
+        "UPDATE streams SET source='kick', title=s.title, kick_started=s.kick_started, kick_ended=s.kick_ended, auto_upload=s.auto_upload, category=s.category
+         FROM (SELECT title,kick_started,kick_ended,auto_upload,category FROM streams WHERE id=?2) s WHERE streams.id=?1",
         rusqlite::params![local, session],
     )?;
     tx.execute("DELETE FROM streams WHERE id=?1", [session])?;
