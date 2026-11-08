@@ -33,7 +33,7 @@ StreamForge uses FFmpeg to read and edit video.
 If you have an NVIDIA graphics card, the app also shows "NVIDIA GPU encoding", so exports will be fast and light on your CPU.
 
 ## 3. Point StreamForge at your OBS recordings
-Kick doesn't let apps download your past streams. Instead, StreamForge uses the recording OBS saves on your PC, which is also better quality.
+StreamForge uses the recording OBS saves on your PC when there is one, because it's usually better quality than Kick's VOD. If a stream has no recording, it downloads the VOD from Kick instead, so this step is optional.
 
 In **OBS**:
 1. **Settings → Output → Recording**: note the **Recording Path**, and set **Recording Format** to **MKV** (MKV survives crashes; MP4 doesn't).
@@ -41,7 +41,7 @@ In **OBS**:
 
 In **StreamForge**: Setup guide → step 2 → **Choose folder**, and pick that same Recording Path.
 
-When a stream ends and OBS finishes writing the file, StreamForge imports it by itself. You can also add any video by hand: **Video Library → Import recording**.
+When a stream ends and OBS finishes writing the file, StreamForge imports it by itself. You can also add any video by hand: **Video Library → Import recording**. For past streams, **Video Library → Past Kick VODs** lists your broadcasts and accepts a kick.com video link.
 
 ## 4. Connect Kick
 This lets StreamForge see when you go live and when you stop, so each recording gets your stream title.
@@ -119,6 +119,7 @@ A 3-hour stream takes roughly 10–20 minutes to transcribe on an RTX 3060. Heav
 |---|---|
 | "Windows protected your PC" when installing | Click **More info → Run anyway**. The installer isn't code-signed yet. |
 | Step 1 stays red after installing FFmpeg | Quit StreamForge from the tray and reopen it. Apps only see newly installed programs after a restart. |
+| A stream says "Waiting for recording" | StreamForge checks for a recording, then looks for the Kick VOD every 10 minutes for 12 hours. Kick's website API is unofficial, so if it changes, add the recording by hand. |
 | A recording never appears in the Library | Check that the folder in Settings is OBS's Recording Path. The file appears about 40 seconds after OBS stops writing it. Anything not `.mkv .mp4 .mov .flv .ts .webm` is ignored. |
 | Sign-in says *"port 47821 is busy"* | Another sign-in is still waiting. Press **Cancel** on it, or quit and reopen StreamForge. |
 | Browser says *redirect_uri mismatch* / *invalid redirect* | The redirect URL in your developer app must be exactly `http://localhost:47821/callback`: no `https`, no trailing slash. |

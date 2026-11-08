@@ -44,6 +44,29 @@ pub struct Settings {
     pub auto_publish: bool,
     /// Spacing for automatic scheduling.
     pub posts_per_day: u32,
+    /// Mask slurs in transcripts and captions and bleep them in the audio.
+    pub censor_enabled: bool,
+    /// "beep" or "mute".
+    pub censor_style: String,
+    /// Extra whole words to censor.
+    pub censor_words: Vec<String>,
+    /// When a Kick stream ends, upload the full stream to YouTube.
+    pub auto_upload_vod: bool,
+    /// YouTube privacy for those uploads: private | unlisted | public.
+    pub vod_privacy: String,
+    /// Links added to the end of every YouTube description.
+    pub socials: Socials,
+}
+
+/// Empty entries are left out of descriptions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Socials {
+    pub kick: String,
+    pub tiktok: String,
+    pub instagram: String,
+    pub x: String,
+    pub discord: String,
 }
 
 impl Default for Settings {
@@ -67,6 +90,12 @@ impl Default for Settings {
             default_privacy: "private".into(),
             auto_publish: false,
             posts_per_day: 2,
+            censor_enabled: true,
+            censor_style: "beep".into(),
+            censor_words: Vec::new(),
+            auto_upload_vod: true,
+            vod_privacy: "private".into(),
+            socials: Socials::default(),
         }
     }
 }
@@ -88,6 +117,9 @@ impl Settings {
         if !["base", "small"].contains(&s.whisper_model.as_str()) { s.whisper_model = "small".into(); }
         if !["blur", "facecam"].contains(&s.clip_layout.as_str()) { s.clip_layout = "blur".into(); }
         if !["private", "unlisted", "public"].contains(&s.default_privacy.as_str()) { s.default_privacy = "private".into(); }
+        if !["private", "unlisted", "public"].contains(&s.vod_privacy.as_str()) { s.vod_privacy = "private".into(); }
+        if !["beep", "mute"].contains(&s.censor_style.as_str()) { s.censor_style = "beep".into(); }
+        s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
         s.trend_keywords = s.trend_keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(5).collect();
         s.kick_channel_slug = s.kick_channel_slug.map(|v| v.trim().trim_start_matches("https://kick.com/").trim_matches('/').to_lowercase()).filter(|v| !v.is_empty());
         db.set_setting(KEY, &serde_json::to_string(&s)?)

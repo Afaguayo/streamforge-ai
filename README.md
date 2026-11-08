@@ -6,7 +6,7 @@ A Windows desktop app built with Tauri 2, Rust, React, SQLite and FFmpeg.
 
 ![StreamForge setup guide](docs/screenshots/setup.png)
 
-> **Status: v0.2 preview.** The whole pipeline is in: live detection → recording import → transcription → best-moment detection → 60–120 s vertical clips with animated captions → thumbnails → review → YouTube and TikTok publishing → real analytics. Instagram and Facebook are waiting on Meta's developer registration. See the [roadmap](ROADMAP.md). Nothing in the app shows fake data.
+> **Status: v0.3 preview.** The whole pipeline is in: live detection → recording import or Kick VOD download → transcription and auto-censor → best-moment detection → 60–120 s vertical clips with animated captions → thumbnails → review → YouTube and TikTok publishing → real analytics. Instagram and Facebook are waiting on Meta's developer registration. See the [roadmap](ROADMAP.md). Nothing in the app shows fake data.
 
 ## Download
 **[⬇ Download the latest installer](https://github.com/Afaguayo/streamforge-ai/releases/latest)** (`StreamForge.AI_<version>_x64-setup.exe`, Windows 10/11, about 4 MB)
@@ -23,7 +23,10 @@ Then follow the **[setup guide](docs/SETUP.md)**. It takes about 10 minutes, and
 | **Publishing** | YouTube (Shorts and full streams) and TikTok, review-first: drafts, scheduling, a drag-and-drop calendar, retries. |
 | **Research + analytics** | Daily YouTube trend report for your keywords, a competitor watchlist, and your own views/likes over time, which also tune clip scoring. |
 | **Kick live detection** | Sees when you go live and when you stop, through Kick's official API. |
-| **Automatic recording import** | Watches your OBS recording folder, waits until the file is finished, matches it to the stream that just ended, and reads its length, resolution and codecs. |
+| **Automatic recording import** | Watches your OBS recording folder, waits until the file is finished, matches it to the stream it was written during, and reads its length, resolution and codecs. |
+| **Kick VOD downloads** | No recording for a stream? StreamForge downloads the VOD from Kick. Past VODs can be picked from a list or added by link. |
+| **Auto-censor** | Masks the N-word in transcripts and captions and bleeps it in clips and full streams. Words it misses can be bleeped by hand. |
+| **Full stream uploads** | After each stream: censored video, thumbnail, title and a description with your links go to YouTube. |
 | **One-click sign-in** | Kick, YouTube, TikTok and Facebook + Instagram. Your browser opens, you approve, and it stays connected; logins renew automatically. |
 | **Crash-safe processing queue** | Jobs survive crashes and restarts and retry on their own; you can retry or cancel from the dashboard. |
 | **Runs in the background** | Lives in the system tray, and can pause heavy work while you're live so your game and stream stay smooth. |
@@ -49,7 +52,7 @@ Then follow the **[setup guide](docs/SETUP.md)**. It takes about 10 minutes, and
 Every post waits for your approval until you turn on full automation.
 
 ## Good to know
-- **Why it needs your OBS recording:** Kick's public API has no way to download past broadcasts. Unofficial methods break without notice, so StreamForge doesn't rely on them, and your local recording is better quality anyway.
+- **OBS recording or Kick VOD:** an OBS recording is used when there is one, because Kick may keep VODs at a lower quality (720p on an unaffiliated channel). Otherwise StreamForge downloads the VOD through Kick's website API. That API is unofficial and can change without notice.
 - **Why you create a developer app per platform:** Kick, Google, TikTok and Meta only allow uploads through an app registered to you. It's free and done once; the [setup guide](docs/SETUP.md) has every click.
 - **Platform limits:**
   - **TikTok** and **YouTube** keep API uploads private until they review your app.

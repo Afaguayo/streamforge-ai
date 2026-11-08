@@ -30,7 +30,9 @@ The Rust core owns all state. Long-running engines are background tasks started 
 - Add a job kind by adding a match arm in `pipeline::run`. Mark it heavy in `is_heavy` so it pauses while you're live.
 
 ### Stream lifecycle
-`live` (Kick says live) → `awaiting_file` (went offline) → `queued` (recording found) → `probed` → *(Phase 3: transcribed → analysed → clipped)*.
+`live` (Kick says live) → `awaiting_file` (went offline) → `downloading` (no local recording, Kick VOD found) → `queued` (file ready) → `probed` → `transcribed` → `analyzed`.
+
+A recording attaches to the session it was written during (file modified time inside the session, plus 20 minutes), never just the newest waiting session: a stream with no recording would otherwise take the next stream's file.
 Local imports start at `queued`.
 
 ### Conventions
@@ -47,7 +49,7 @@ Local imports start at `queued`.
 - Token blobs are stored as `<platform>.token` in Credential Manager. The `accounts` table stores only the display name, IDs and Pages.
 
 ### Clip pipeline
-`probe → transcribe → analyze → render (top N) + thumbnails → [approve] → publish`. Each arrow is a queued job; `is_heavy` jobs wait while you're live and when disk space is under 2 GB.
+`find_vod → download_vod → probe → transcribe → analyze → render (top N) + thumbnails → [full stream upload] → [approve] → publish`. Each arrow is a queued job; `is_heavy` jobs wait while you're live and when disk space is under 2 GB.
 - Transcription: `whisper-cli -ml 1 -sow -oj` gives one word per segment with millisecond offsets; stored as `[[start, end, word], …]` in `transcripts`.
 - Moments: per-second features → smoothed excitement → peaks → windows (35 s lead-in, 40 s payoff) snapped to pauses, clamped to 60–120 s, non-overlapping.
 - Claude (`claude-opus-5-5`, structured JSON output, `fallbacks: "default"`) re-scores candidates and writes titles/hooks only when `llm.api_key` is set; failures fall back to heuristic scores.
@@ -59,8 +61,15 @@ Local imports start at `queued`.
 - Real media: `STREAMFORGE_TEST_VIDEO=<≥70 s video> cargo test -- --ignored` renders both layouts (incl. NVENC), a cover and a thumbnail, and runs loudness/scene analysis.
 
 ## Platform constraints found (verify before building each phase)
-- **Kick:** an app token (client_credentials) reads `GET /public/v1/channels?slug=`. The public API has no VOD endpoint. Webhooks (`livestream.status.updated`) need a reachable endpoint, so the app polls instead.
+- **Kick:** an app token (client_credentials) reads `GET /public/v1/channels?slug=`. The public API has no VOD endpoint, so VODs come from the website's unofficial API: `kick.com/api/v2/channels/<slug>/videos` and `kick.com/api/v1/video/<uuid>`. Send an honest User-Agent: a browser one gets a 403. Webhooks (`livestream.status.updated`) need a reachable endpoint, so the app polls instead.
 - **TikTok:** an unaudited Content Posting API client can post only to private accounts, for at most 5 users per 24 h.
 - **YouTube:** uploads from an unverified API project are private-only until audited. One upload costs about 1,600 of the default 10,000 daily quota units.
 - **Facebook Reels API:** accepts 3–90 s videos. Clips over 90 s must be flagged, not cut silently, to respect the 60 s minimum.
 - **Instagram:** needs a Professional account and Meta App Review for `instagram_content_publish`.
+
+### Transcription and the censor
+Long recordings go to whisper.cpp in 3-minute pieces, cut at the quietest moment near each boundary. On a single long input it picks one language from the opening seconds and can loop on a line for minutes: a real 116-minute stream came back 90% repeats and translated into Spanish. Pieces, `-mc 0`, voice detection at threshold 0.35 and `drop_repeats` took that to 4%. The default threshold of 0.5 lost half the speech on busy stretches.
+
+The censor listens twice. The transcript pass found the word in 9 of the 11 spots known on that stream; a second pass without voice detection covers the rest (`censor::add_missed`). It makes transcription 3 to 4 times slower. `transcripts.engine` records which method made a transcript; older ones are redone at startup.
+
+Censored words are stored masked, so everything built on the transcript is clean. The stars mark what gets bleeped (`Word.b`). Clip words live on `clips.words` so caption edits, hand bleeps and speakers survive a re-render. Full streams get a bleeped copy (video copied, audio re-encoded) just before upload, deleted afterwards. A stream the censor hasn't read refuses to upload.

@@ -2,10 +2,10 @@
 //! Review-first: approving a clip creates *draft* posts; nothing uploads until a post is
 //! scheduled or published by you, unless full automation is switched on in Settings.
 
-use crate::{db::Db, llm, research, settings::Settings};
+use crate::{db::Db, llm, research, settings::{Settings, Socials}};
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Duration, Timelike, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Clone)]
@@ -70,7 +70,8 @@ pub fn media_for(db: &Db, p: &Post) -> Result<(PathBuf, f64, Option<PathBuf>)> {
         return Ok((PathBuf::from(path), end - start, None));
     }
     let sid = p.stream_id.ok_or_else(|| anyhow!("post has no media"))?;
-    let (path, dur): (Option<String>, Option<f64>) = conn.query_row("SELECT file_path, duration_s FROM streams WHERE id=?1", [sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    // The bleeped copy when there is one.
+    let (path, dur): (Option<String>, Option<f64>) = conn.query_row("SELECT COALESCE(censored_path, file_path), duration_s FROM streams WHERE id=?1", [sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let thumb: Option<String> = conn.query_row("SELECT path FROM thumbnails WHERE stream_id=?1 AND selected=1", [sid], |r| r.get(0)).ok();
     Ok((PathBuf::from(path.ok_or_else(|| anyhow!("recording file missing"))?), dur.unwrap_or(0.0), thumb.map(PathBuf::from)))
 }
@@ -88,6 +89,43 @@ pub fn duration_problem(platform: &str, secs: f64) -> Option<String> {
         "facebook" if secs > 90.0 => Some(format!("Facebook Reels via API allow 3–90 s; this clip is {secs:.0} s, so it isn't sent there")),
         _ => None,
     }
+}
+
+fn link(base: &str, value: &str) -> String {
+    let v = value.trim();
+    if v.starts_with("http") { v.to_string() } else { format!("{base}{}", v.trim_start_matches('@')) }
+}
+
+/// The links section of a description. A handle or a full URL both work.
+pub fn links_text(s: &Socials) -> String {
+    let rows = [
+        ("Kick", "https://kick.com/", &s.kick),
+        ("TikTok", "https://www.tiktok.com/@", &s.tiktok),
+        ("Instagram", "https://www.instagram.com/", &s.instagram),
+        ("X", "https://x.com/", &s.x),
+        ("Discord", "https://discord.gg/", &s.discord),
+    ];
+    let lines: Vec<String> = rows.iter().filter(|(_, _, v)| !v.trim().is_empty()).map(|(n, b, v)| format!("{n}: {}", link(b, v))).collect();
+    if lines.is_empty() { String::new() } else { format!("Follow me:\n{}", lines.join("\n")) }
+}
+
+/// Socials from Settings; Kick and TikTok fall back to the connected accounts.
+fn socials(db: &Db) -> Socials {
+    let s = Settings::load(db);
+    let mut out = s.socials;
+    if out.kick.trim().is_empty() {
+        out.kick = s.kick_channel_slug.unwrap_or_default();
+    }
+    if out.tiktok.trim().is_empty() {
+        out.tiktok = db.conn().query_row("SELECT display_name FROM accounts WHERE platform='tiktok'", [], |r| r.get(0)).unwrap_or_default();
+    }
+    out
+}
+
+/// A YouTube description with the links section on the end.
+fn with_links(db: &Db, description: &str) -> String {
+    let links = links_text(&socials(db));
+    [description.trim(), links.as_str()].iter().filter(|p| !p.is_empty()).copied().collect::<Vec<_>>().join("\n\n")
 }
 
 fn default_tags(db: &Db, category: &str) -> Vec<String> {
@@ -140,6 +178,7 @@ pub async fn approve_clip(db: &Db, clip_id: i64) -> Result<Vec<String>> {
             },
             _ => heuristic_meta(db, platform, &title, &category),
         };
+        let d = if platform == "youtube" { with_links(db, &d) } else { d };
         db.conn().execute(
             "INSERT INTO posts(clip_id, platform, title, description, tags, privacy) VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![clip_id, platform, t, d, serde_json::to_string(&tags)?, s.default_privacy],
@@ -157,32 +196,74 @@ fn heuristic_meta(db: &Db, platform: &str, title: &str, category: &str) -> (Stri
     }
 }
 
-/// Creates a draft for uploading the full recording to YouTube.
-pub async fn draft_full_video(db: &Db, stream_id: i64) -> Result<i64> {
-    let (title, dur): (String, Option<f64>) = db.conn().query_row("SELECT title, duration_s FROM streams WHERE id=?1", [stream_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    if dur.is_none() {
-        bail!("this recording hasn't been read yet");
+/// Title, description, tags and thumbnail wording for a full stream.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StreamMeta {
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub thumb_text: String,
+}
+
+/// Written by Claude once and kept when a key is set, otherwise built from the stream title.
+pub async fn stream_meta(db: &Db, stream_id: i64) -> Result<StreamMeta> {
+    let (title, started, saved): (String, Option<String>, Option<String>) =
+        db.conn().query_row("SELECT title, kick_started, meta FROM streams WHERE id=?1", [stream_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    if let Some(m) = saved.and_then(|s| serde_json::from_str(&s).ok()) {
+        return Ok(m);
     }
-    let summary: String = db.conn().query_row(
-        "SELECT COALESCE(GROUP_CONCAT(transcript, ' '), '') FROM (SELECT transcript FROM clips WHERE stream_id=?1 AND status!='rejected' ORDER BY score DESC LIMIT 4)",
+    let highlights: String = db.conn().query_row(
+        "SELECT COALESCE(GROUP_CONCAT(transcript, '\n\n'), '') FROM (SELECT transcript FROM clips WHERE stream_id=?1 AND status!='rejected' ORDER BY score DESC LIMIT 5)",
         [stream_id],
         |r| r.get(0),
     )?;
-    let (t, d, tags) = if llm::available() && !summary.is_empty() {
-        match llm::metadata("youtube", &summary, &title, true).await {
-            Ok(m) => (m.title, m.description, m.tags),
-            Err(_) => (title.clone(), "Full Kick stream.".into(), default_tags(db, "stream")),
+    if llm::available() && !highlights.is_empty() {
+        match llm::video_package(&title, &highlights).await {
+            Ok(p) => {
+                let m = StreamMeta { title: p.title, description: p.description, tags: p.tags, thumb_text: p.thumb_text };
+                db.conn().execute("UPDATE streams SET meta=?2 WHERE id=?1", rusqlite::params![stream_id, serde_json::to_string(&m)?])?;
+                return Ok(m);
+            }
+            Err(e) => db.log("warn", "metadata", &format!("Claude metadata skipped: {e:#}")),
         }
-    } else {
-        (title.clone(), "Full Kick stream.".into(), default_tags(db, "stream"))
-    };
-    let privacy = Settings::load(db).default_privacy;
+    }
+    let date = started.and_then(|t| DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.format("%B %-d, %Y").to_string());
+    Ok(StreamMeta {
+        description: match date { Some(d) => format!("Full stream from {d}. Streamed live on Kick."), None => "Full stream. Streamed live on Kick.".into() },
+        tags: default_tags(db, "stream"),
+        thumb_text: crate::render::headline(&title),
+        title,
+    })
+}
+
+/// Creates a draft for uploading the full recording to YouTube.
+pub async fn draft_full_video(db: &Db, stream_id: i64) -> Result<i64> {
+    let dur: Option<f64> = db.conn().query_row("SELECT duration_s FROM streams WHERE id=?1", [stream_id], |r| r.get(0))?;
+    if dur.is_none() {
+        bail!("this recording hasn't been read yet");
+    }
+    let m = stream_meta(db, stream_id).await?;
+    let privacy = Settings::load(db).vod_privacy;
+    // Worked out first: it needs the database, which `execute` below holds until it returns.
+    let description = with_links(db, &m.description);
     db.conn().execute(
         "INSERT INTO posts(stream_id, platform, title, description, tags, privacy) VALUES(?1,'youtube',?2,?3,?4,?5)
          ON CONFLICT DO NOTHING",
-        rusqlite::params![stream_id, t, d, serde_json::to_string(&tags)?, privacy],
+        rusqlite::params![stream_id, m.title, description, serde_json::to_string(&m.tags)?, privacy],
     )?;
     Ok(db.conn().query_row("SELECT id FROM posts WHERE stream_id=?1 AND platform='youtube'", [stream_id], |r| r.get(0))?)
+}
+
+/// Uploads a finished stream to YouTube if it was marked for that when it went live.
+pub async fn auto_upload(db: &Db, stream_id: i64) -> Result<()> {
+    let wanted: i64 = db.conn().query_row("SELECT auto_upload FROM streams WHERE id=?1", [stream_id], |r| r.get(0))?;
+    if wanted == 0 || !Settings::load(db).auto_upload_vod {
+        return Ok(());
+    }
+    let id = draft_full_video(db, stream_id).await?;
+    schedule(db, id, None)?;
+    db.conn().execute("UPDATE streams SET auto_upload=0 WHERE id=?1", [stream_id])?;
+    Ok(())
 }
 
 /// Queues a post for `at` (UTC RFC 3339) or now.
@@ -336,6 +417,40 @@ mod tests {
         assert_eq!(s[1].to_rfc3339(), "2026-10-30T23:00:00+00:00");
         let taken = [s[0]];
         assert_eq!(next_slots(&taken, 2, 1, now)[0], s[1]);
+    }
+
+    #[test]
+    fn links_accept_handles_and_urls_and_skip_blanks() {
+        let s = Socials { kick: "frijolito-trash".into(), tiktok: "@me".into(), instagram: "https://instagram.com/me".into(), ..Default::default() };
+        assert_eq!(links_text(&s), "Follow me:\nKick: https://kick.com/frijolito-trash\nTikTok: https://www.tiktok.com/@me\nInstagram: https://instagram.com/me");
+        assert_eq!(links_text(&Socials::default()), "");
+    }
+
+    #[test]
+    fn descriptions_end_with_the_links() {
+        let db = Db::memory().unwrap();
+        let mut s = Settings::load(&db);
+        s.socials.instagram = "frijolito".into();
+        s.kick_channel_slug = Some("frijolito-trash".into());
+        s.save(&db).unwrap();
+        let d = with_links(&db, "Full stream.");
+        assert!(d.starts_with("Full stream.\n\nFollow me:"), "{d}");
+        assert!(d.contains("https://kick.com/frijolito-trash") && d.contains("https://www.instagram.com/frijolito"));
+    }
+
+    #[test]
+    fn auto_upload_only_touches_streams_marked_for_it() {
+        let db = Db::memory().unwrap();
+        db.conn().execute("INSERT INTO streams(source,title,status,duration_s) VALUES('local','old','analyzed',100)", []).unwrap();
+        db.conn().execute("INSERT INTO streams(source,title,status,duration_s,auto_upload) VALUES('kick','new','analyzed',100,1)", []).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(auto_upload(&db, 1)).unwrap();
+        assert!(list_posts(&db).unwrap().is_empty());
+        rt.block_on(auto_upload(&db, 2)).unwrap();
+        rt.block_on(auto_upload(&db, 2)).unwrap();
+        let p = list_posts(&db).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].status.as_str(), p[0].privacy.as_str()), ("scheduled", "private"));
     }
 
     #[test]

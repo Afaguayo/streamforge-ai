@@ -8,6 +8,7 @@ export function StreamStatus({ s }: { s: Stream["status"] }) {
   const map = {
     live: <Badge tone="live">● Live</Badge>,
     awaiting_file: <Badge tone="warn">Waiting for recording</Badge>,
+    downloading: <Badge tone="info">Downloading from Kick</Badge>,
     queued: <Badge tone="info">Queued</Badge>,
     probed: <Badge tone="info">Imported</Badge>,
     transcribed: <Badge tone="info">Transcribed</Badge>,
@@ -17,7 +18,10 @@ export function StreamStatus({ s }: { s: Stream["status"] }) {
   return map[s] ?? <Badge>{s}</Badge>;
 }
 
-const JOB_LABEL: Record<string, string> = {
+export const JOB_LABEL: Record<string, string> = {
+  find_vod: "Finding the Kick VOD",
+  download_vod: "Downloading from Kick",
+  install_speakers: "Installing speaker detection",
   probe: "Read recording metadata",
   install_whisper: "Install transcription engine",
   transcribe: "Transcribe speech",

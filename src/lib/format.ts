@@ -19,6 +19,17 @@ export function bytes(n: number | null | undefined): string {
   return `${v.toFixed(i >= 3 ? 2 : 0)} ${units[i]}`;
 }
 
+/**
+ * Seconds left for a job, from how fast it has moved since it was first seen.
+ * Null until there's enough movement to say anything useful.
+ */
+export function remaining(progress: number, startProgress: number, startedAt: number, now: number): number | null {
+  const moved = progress - startProgress;
+  const secs = (now - startedAt) / 1000;
+  if (moved < 0.005 || secs < 10) return null;
+  return ((1 - progress) * secs) / moved;
+}
+
 /** "3 min ago" style label for UTC ISO timestamps from SQLite. */
 export function ago(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return "never";

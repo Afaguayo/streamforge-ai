@@ -1,4 +1,5 @@
 mod analysis;
+mod censor;
 mod commands;
 mod db;
 mod ingest;
@@ -52,6 +53,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let db = Arc::new(db::Db::open(&data_dir.join("streamforge.db"))?);
             let resumed = db.recover_interrupted()?;
+            pipeline::redo_old_transcripts(&db)?;
             db.log("info", "app", &format!("Started; {resumed} interrupted job(s) resumed"));
 
             let kick_state = Arc::new(Mutex::new(kick::KickState::default()));
@@ -117,12 +119,19 @@ pub fn run() {
             commands::disconnect_account,
             studio::engine_status,
             studio::install_engine,
+            studio::install_speakers,
             studio::process_stream,
             studio::list_clips,
             studio::approve_clip,
             studio::reject_clip,
             studio::restore_clip,
             studio::edit_clip,
+            studio::edit_clip_text,
+            studio::toggle_bleep,
+            studio::download_clip,
+            studio::list_kick_vods,
+            studio::import_kick_vod,
+            studio::import_kick_link,
             studio::render_clip,
             studio::list_thumbnails,
             studio::select_thumbnail,

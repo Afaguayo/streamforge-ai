@@ -1,8 +1,9 @@
-import { Check, Pencil, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
+import { Check, Download, Pencil, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { PageId } from "../App";
 import { Badge, Button, Card, Empty, Field, Notice, Page, inputCls } from "../components/ui";
-import { api, errorText, fileUrl, type Clip } from "../lib/api";
+import { api, errorText, fileUrl, type Clip, type Word } from "../lib/api";
 import { duration } from "../lib/format";
 import { usePoll } from "../lib/usePoll";
 
@@ -15,6 +16,45 @@ const DIMENSIONS: [keyof Clip["scores"], string][] = [
   ["shareability", "Shareability"],
   ["trend", "Trend fit"],
 ];
+
+/// Same colours as the burned-in captions (render.rs).
+const SPEAKER_COLOURS = ["#FFFFFF", "#4FD8FF", "#FF7AB8", "#9CFF6B", "#FFB84D", "#C9A2FF"];
+const speakerColour = (sp: number) => SPEAKER_COLOURS[sp % SPEAKER_COLOURS.length];
+
+type Turn = { sp: number; first: number; words: Word[] };
+
+/// Consecutive words by the same speaker. `edit_clip_text` expects this same grouping.
+function turnsOf(words: Word[]): Turn[] {
+  const out: Turn[] = [];
+  words.forEach((w, i) => {
+    const last = out[out.length - 1];
+    if (last && last.sp === w.sp) last.words.push(w);
+    else out.push({ sp: w.sp, first: i, words: [w] });
+  });
+  return out;
+}
+
+const masked = (t: string) => (t.includes("*") ? t : t[0] + "*".repeat(Math.max(t.length - 1, 1)));
+
+function Transcript({ c, onBleep }: { c: Clip; onBleep: (index: number) => void }) {
+  const turns = turnsOf(c.words);
+  const speakers = new Set(c.words.map((w) => w.sp)).size;
+  return (
+    <div className="mt-3 max-h-64 overflow-y-auto rounded-lg bg-ink-950 p-3 text-sm leading-relaxed">
+      <p className="mb-2 text-xs text-ink-500">Click a word to bleep or un-bleep it, then re-render.</p>
+      {turns.map((t) => (
+        <p key={t.first} className="mb-2">
+          {speakers > 1 && <span className="mr-2 text-[11px] font-semibold uppercase tracking-wider" style={{ color: speakerColour(t.sp) }}>Speaker {t.sp + 1}</span>}
+          {t.words.map((w, i) => (
+            <button key={i} onClick={() => onBleep(t.first + i)} title={w.b ? "Un-bleep" : "Bleep"} className={`mr-1 rounded px-0.5 hover:bg-ink-800 ${w.b ? "bg-red-950" : ""}`} style={{ color: speakerColour(t.sp) }}>
+              {w.b ? masked(w.t) : w.t}
+            </button>
+          ))}
+        </p>
+      ))}
+    </div>
+  );
+}
 
 function ScoreBars({ c }: { c: Clip }) {
   return (
@@ -39,10 +79,14 @@ function EditForm({ c, onDone }: { c: Clip; onDone: (msg: string | null) => void
   const [end, setEnd] = useState(c.end_s.toFixed(1));
   const [title, setTitle] = useState(c.title ?? "");
   const [hook, setHook] = useState(c.hook ?? "");
+  const turns = useMemo(() => turnsOf(c.words), [c.words]);
+  const [texts, setTexts] = useState(() => turns.map((t) => t.words.map((w) => (w.b ? masked(w.t) : w.t)).join(" ")));
   const len = Number(end) - Number(start);
-  const ok = len >= 60 && len <= 120;
-  const save = async () => {
+  const ok = len >= 5 && len <= 180;
+  const saveEdits = async () => {
     try {
+      const original = turns.map((t) => t.words.map((w) => (w.b ? masked(w.t) : w.t)).join(" "));
+      if (texts.some((t, i) => t !== original[i])) await api.editClipText(c.id, texts);
       await api.editClip(c.id, Number(start), Number(end), title, hook);
       onDone("Saved; re-rendering the clip.");
     } catch (e) {
@@ -54,12 +98,22 @@ function EditForm({ c, onDone }: { c: Clip; onDone: (msg: string | null) => void
       <div className="grid grid-cols-3 gap-3">
         <Field label="Start (s)"><input className={inputCls} value={start} onChange={(e) => setStart(e.target.value)} /></Field>
         <Field label="End (s)"><input className={inputCls} value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
-        <Field label="Length"><div className={`py-2 text-sm ${ok ? "text-ink-100" : "text-red-300"}`}>{duration(len)} {ok ? "" : "· must be 60–120 s"}</div></Field>
+        <Field label="Length"><div className={`py-2 text-sm ${ok ? "text-ink-100" : "text-red-300"}`}>{duration(len)} {ok ? "" : "· must be 5–180 s"}</div></Field>
       </div>
       <Field label="Title"><input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
       <Field label="On-screen hook" hint="Shown for the first 3 seconds. Leave empty to use the title."><input className={inputCls} value={hook} onChange={(e) => setHook(e.target.value)} /></Field>
+      {turns.length > 0 && (
+        <Field label="Captions" hint="Fix what the speech engine got wrong. Each box is one speaker's turn.">
+          <div className="space-y-2">
+            {turns.map((t, i) => (
+              <textarea key={t.first} rows={Math.min(4, Math.ceil(texts[i].length / 80) + 1)} className={inputCls} style={{ color: speakerColour(t.sp) }} value={texts[i]}
+                onChange={(e) => setTexts(texts.map((x, j) => (j === i ? e.target.value : x)))} />
+            ))}
+          </div>
+        </Field>
+      )}
       <div className="flex gap-2">
-        <Button variant="primary" disabled={!ok} onClick={save}>Save and re-render</Button>
+        <Button variant="primary" disabled={!ok} onClick={saveEdits}>Save and re-render</Button>
         <Button onClick={() => onDone(null)}>Cancel</Button>
       </div>
     </div>
@@ -78,6 +132,11 @@ function ClipCard({ c, refresh, notify }: { c: Clip; refresh: () => void; notify
     } catch (e) {
       notify(errorText(e));
     }
+  };
+  const download = async () => {
+    const name = (c.title ?? "clip").replace(/[^\p{L}\p{N} _-]/gu, "").trim().slice(0, 60) || "clip";
+    const dest = await save({ defaultPath: `${name}.mp4`, filters: [{ name: "Video", extensions: ["mp4"] }] });
+    if (dest) act(() => api.downloadClip(c.id, dest), "Clip saved.");
   };
   return (
     <Card>
@@ -122,10 +181,13 @@ function ClipCard({ c, refresh, notify }: { c: Clip; refresh: () => void; notify
             )}
             <Button onClick={() => setEditing(!editing)}><Pencil size={14} /> Edit</Button>
             <Button onClick={() => act(() => api.renderClip(c.id), "Re-render queued.")}><RefreshCw size={14} /> {c.render_status === "done" ? "Re-render" : "Render"}</Button>
+            {c.render_status === "done" && c.render_path && <Button onClick={download}><Download size={14} /> Download</Button>}
             {c.transcript && <Button onClick={() => setShowText(!showText)}>{showText ? "Hide" : "Show"} transcript</Button>}
           </div>
           {editing && <EditForm c={c} onDone={(m) => { setEditing(false); if (m) notify(m); refresh(); }} />}
-          {showText && <p className="mt-3 max-h-48 overflow-y-auto rounded-lg bg-ink-950 p-3 text-sm leading-relaxed text-ink-300">{c.transcript}</p>}
+          {showText && (c.words.length > 0
+            ? <Transcript c={c} onBleep={(i) => act(() => api.toggleBleep(c.id, i), "Changed. Re-render the clip to hear it.")} />
+            : <p className="mt-3 max-h-48 overflow-y-auto rounded-lg bg-ink-950 p-3 text-sm leading-relaxed text-ink-300">{c.transcript}</p>)}
         </div>
       </div>
     </Card>

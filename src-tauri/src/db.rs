@@ -156,6 +156,17 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     );
     "#,
+    // 4: Kick VOD downloads, the censor, per-clip editable words
+    r#"
+    ALTER TABLE streams ADD COLUMN kick_vod_id TEXT;
+    ALTER TABLE streams ADD COLUMN vod_source TEXT;                -- Kick playlist URL
+    ALTER TABLE streams ADD COLUMN auto_upload INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE streams ADD COLUMN censored_path TEXT;             -- full stream with bleeped audio
+    ALTER TABLE streams ADD COLUMN meta TEXT;                      -- JSON title/description/tags/thumb_text
+    CREATE UNIQUE INDEX streams_kick_vod ON streams(kick_vod_id) WHERE kick_vod_id IS NOT NULL;
+    ALTER TABLE transcripts ADD COLUMN engine INTEGER NOT NULL DEFAULT 1;  -- 2 = chunked, repeat-free
+    ALTER TABLE clips ADD COLUMN words TEXT;                       -- JSON [{s,e,t,sp,b}], recording time
+    "#,
 ];
 
 pub struct Db(Mutex<Connection>);
@@ -247,7 +258,7 @@ impl Db {
     }
 }
 
-const STREAM_COLS: &str = "id,source,title,kick_started,kick_ended,file_path,file_size,duration_s,width,height,fps,video_codec,audio_codec,status,error,created_at";
+const STREAM_COLS: &str = "id,source,title,kick_started,kick_ended,file_path,file_size,duration_s,width,height,fps,video_codec,audio_codec,status,error,created_at,kick_vod_id";
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Stream {
@@ -267,6 +278,7 @@ pub struct Stream {
     pub status: String,
     pub error: Option<String>,
     pub created_at: String,
+    pub kick_vod_id: Option<String>,
 }
 
 impl Stream {
@@ -288,6 +300,7 @@ impl Stream {
             status: r.get(13)?,
             error: r.get(14)?,
             created_at: r.get(15)?,
+            kick_vod_id: r.get(16)?,
         })
     }
 }

@@ -23,14 +23,21 @@ pub struct Word {
     pub s: f64,
     pub e: f64,
     pub t: String,
+    /// Speaker number within a clip (0 when speakers haven't been separated).
+    #[serde(default)]
+    pub sp: u8,
+    /// Bleeped in the audio.
+    #[serde(default)]
+    pub b: bool,
 }
 
 // ---------- transcription ----------
 
-pub async fn extract_audio(video: &str, wav: &Path) -> Result<()> {
+/// Writes the audio as raw 16 kHz mono s16le, the form `split_audio` reads.
+pub async fn extract_audio(video: &str, raw: &Path) -> Result<()> {
     let out = hidden("ffmpeg")
-        .args(["-y", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-        .arg(wav)
+        .args(["-y", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le"])
+        .arg(raw)
         .output()
         .await
         .context("couldn't run ffmpeg")?;
@@ -40,24 +47,114 @@ pub async fn extract_audio(video: &str, wav: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs whisper-cli with one word per segment; reports 0..1 progress.
-pub async fn run_whisper(exe: &Path, model: &Path, wav: &Path, out_base: &Path, mut progress: impl FnMut(f64)) -> Result<(Option<String>, Vec<Word>)> {
+/// Audio is cut into pieces of about this length. whisper.cpp picks one language per input
+/// and otherwise repeats itself on long files, so each piece gets a fresh start.
+const CHUNK_SECS: usize = 180;
+/// Each cut lands on the quietest moment in this many seconds before the target.
+const CUT_SEARCH_SECS: usize = 6;
+const RATE: usize = 16_000;
+
+fn wav_header(samples: usize) -> Vec<u8> {
+    let data = (samples * 2) as u32;
+    let mut h = Vec::with_capacity(44);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(36 + data).to_le_bytes());
+    h.extend_from_slice(b"WAVEfmt ");
+    h.extend_from_slice(&16u32.to_le_bytes());
+    h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    h.extend_from_slice(&1u16.to_le_bytes()); // mono
+    h.extend_from_slice(&(RATE as u32).to_le_bytes());
+    h.extend_from_slice(&((RATE * 2) as u32).to_le_bytes());
+    h.extend_from_slice(&2u16.to_le_bytes());
+    h.extend_from_slice(&16u16.to_le_bytes());
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data.to_le_bytes());
+    h
+}
+
+/// Index of the quietest 50 ms window in `pcm`, so a cut doesn't split a word.
+pub fn quietest(pcm: &[i16]) -> usize {
+    const WIN: usize = RATE / 20;
+    pcm.chunks(WIN)
+        .enumerate()
+        .min_by_key(|(_, c)| c.iter().map(|s| (*s as i64).abs()).sum::<i64>() / c.len() as i64)
+        .map(|(i, _)| i * WIN)
+        .unwrap_or(0)
+}
+
+/// Splits 16 kHz mono s16le audio into `cNNNN.wav` files in `dir`.
+/// Returns each file name and its start time in seconds.
+pub fn split_audio(raw: &Path, dir: &Path) -> Result<Vec<(String, f64)>> {
+    use std::io::{Read, Write};
+    std::fs::create_dir_all(dir)?;
+    let mut f = std::io::BufReader::new(std::fs::File::open(raw)?);
+    let target = CHUNK_SECS * RATE;
+    let mut pending: Vec<i16> = Vec::new();
+    let mut out = Vec::new();
+    let mut offset = 0usize; // samples already written
+    let mut buf = vec![0u8; 2 * RATE * 10];
+    let mut eof = false;
+    while !eof || !pending.is_empty() {
+        while !eof && pending.len() < target {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                eof = true;
+            }
+            pending.extend(buf[..n & !1].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+        }
+        let cut = if pending.len() >= target {
+            let from = target - CUT_SEARCH_SECS * RATE;
+            from + quietest(&pending[from..target])
+        } else {
+            pending.len()
+        };
+        let name = format!("c{:04}.wav", out.len());
+        let mut w = std::io::BufWriter::new(std::fs::File::create(dir.join(&name))?);
+        w.write_all(&wav_header(cut))?;
+        for s in &pending[..cut] {
+            w.write_all(&s.to_le_bytes())?;
+        }
+        w.flush()?;
+        out.push((name, offset as f64 / RATE as f64));
+        offset += cut;
+        pending.drain(..cut);
+    }
+    Ok(out)
+}
+
+/// Runs whisper-cli over the pieces in `dir` and joins the results; reports 0..1 progress.
+///
+/// `-mc 0` stops each segment being fed the previous text and voice detection skips the
+/// silence and game noise: both are what send whisper into repeating one line for minutes.
+/// The threshold is below the default of 0.5, which dropped half the speech on a stretch of
+/// friends talking over game audio. Without `vad` every moment is transcribed: more
+/// repeats and worse timings, but it hears some words the other misses.
+pub async fn run_whisper(exe: &Path, model: &Path, vad: Option<&Path>, dir: &Path, chunks: &[(String, f64)], mut progress: impl FnMut(f64)) -> Result<Heard> {
     let threads = std::thread::available_parallelism().map(|n| (n.get() / 2).max(2)).unwrap_or(4).to_string();
-    let mut child = hidden(&exe.to_string_lossy())
-        .arg("-m").arg(model)
-        .arg("-f").arg(wav)
-        .args(["-l", "auto", "-ml", "1", "-sow", "-oj", "-pp", "-np", "-t", &threads])
-        .arg("-of").arg(out_base)
+    let mut cmd = hidden(&exe.to_string_lossy());
+    // Short relative names: hundreds of pieces must fit on one command line.
+    cmd.current_dir(dir).arg("-m").arg(model).arg("-f").args(chunks.iter().map(|c| &c.0));
+    cmd.args(["-l", "auto", "-mc", "0"]);
+    if let Some(vad) = vad {
+        cmd.args(["--vad", "-vt", "0.35", "-vm"]).arg(vad);
+    }
+    let mut child = cmd
+        .args(["-ml", "1", "-sow", "-oj", "-pp", "-np", "-t", &threads])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("couldn't start the speech engine")?;
     let mut tail = Vec::new();
+    let (mut done, mut last) = (0usize, 0.0f64);
     if let Some(err) = child.stderr.take() {
         let mut lines = BufReader::new(err).lines();
         while let Some(line) = lines.next_line().await? {
             if let Some(p) = line.split("progress =").nth(1).and_then(|v| v.trim().trim_end_matches('%').trim().parse::<f64>().ok()) {
-                progress(p / 100.0);
+                if p < last {
+                    done += 1; // progress restarts for each input file
+                }
+                last = p;
+                progress(((done as f64 + p / 100.0) / chunks.len().max(1) as f64).min(1.0));
             }
             tail.push(line);
             if tail.len() > 20 {
@@ -69,8 +166,103 @@ pub async fn run_whisper(exe: &Path, model: &Path, wav: &Path, out_base: &Path, 
     if !status.success() {
         return Err(anyhow!("speech engine failed: {}", tail.join(" | ")));
     }
-    let json = std::fs::read_to_string(out_base.with_extension("json")).context("speech engine wrote no transcript")?;
-    parse_whisper_json(&json)
+    let mut parts = Vec::new();
+    for (name, start) in chunks {
+        // A piece with no speech writes no transcript.
+        if let Ok(json) = std::fs::read_to_string(dir.join(format!("{name}.json"))) {
+            let (lang, words) = parse_whisper_json(&json)?;
+            parts.push((lang, *start, words));
+        }
+    }
+    if parts.is_empty() {
+        return Err(anyhow!("speech engine wrote no transcript"));
+    }
+    Ok(join_chunks(parts))
+}
+
+/// A joined transcript.
+pub struct Heard {
+    /// The most common language across pieces with speech.
+    pub lang: Option<String>,
+    pub words: Vec<Word>,
+    /// Time spans of the pieces heard as English, for words that are only slurs in English.
+    pub english: Vec<(f64, f64)>,
+}
+
+/// Puts pieces back on the recording's timeline, repairs timings and removes repeats.
+pub fn join_chunks(parts: Vec<(Option<String>, f64, Vec<Word>)>) -> Heard {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    let mut words = Vec::new();
+    let mut english = Vec::new();
+    for (lang, start, part) in parts {
+        if let (Some(l), Some(last)) = (&lang, part.last()) {
+            *counts.entry(l.clone()).or_default() += 1;
+            if l == "en" {
+                english.push((start, start + last.e + 1.0));
+            }
+        }
+        words.extend(part.into_iter().map(|w| Word { s: w.s + start, e: (w.e + start).max(w.s + start + 0.12), ..w }));
+    }
+    let lang = counts.into_iter().max_by_key(|(_, n)| *n).map(|(l, _)| l);
+    Heard { lang, words: drop_repeats(words), english }
+}
+
+/// Removes runs where the same words repeat over and over. The engine's habit of looping on
+/// a line survives in short bursts even with the fixes above. Real repetition stays: a word
+/// said up to five times, or a phrase said twice.
+pub fn drop_repeats(words: Vec<Word>) -> Vec<Word> {
+    const LONGEST: usize = 14;
+    let key: Vec<String> = words.iter().map(|w| norm(&w.t)).collect();
+    let mut keep = vec![true; words.len()];
+    let mut i = 0;
+    while i < words.len() {
+        let mut skipped = false;
+        for n in 1..=LONGEST { // shortest first: two copies of a line must not count as one unit
+            let mut count = 1;
+            while i + (count + 1) * n <= words.len() && key[i..i + n] == key[i + count * n..i + (count + 1) * n] {
+                count += 1;
+            }
+            let (min, kept) = if n == 1 { (6, 3) } else { (3, 2) };
+            if count >= min {
+                keep[i + kept * n..i + count * n].fill(false);
+                i += count * n;
+                skipped = true;
+                break;
+            }
+        }
+        if !skipped {
+            i += 1;
+        }
+    }
+    let mut flags = keep.iter();
+    words.into_iter().filter(|_| *flags.next().unwrap()).collect()
+}
+
+/// Drops sound descriptions the engine writes as words: `*laughs*`, `*speaking in Spanish*`,
+/// `(risas)`. They'd show up in captions, and stars in them looked like censored words.
+pub fn drop_sound_tags(words: Vec<Word>) -> Vec<Word> {
+    let mut open: Option<char> = None;
+    words
+        .into_iter()
+        .filter(|w| {
+            let t = w.t.trim_matches(|c: char| ",.!?¡¿".contains(c));
+            if let Some(close) = open {
+                if t.ends_with(close) {
+                    open = None;
+                }
+                return false;
+            }
+            for (start, close) in [('*', '*'), ('(', ')')] {
+                if t.starts_with(start) {
+                    if !(t.len() > 1 && t.ends_with(close)) {
+                        open = Some(close);
+                    }
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 pub fn parse_whisper_json(json: &str) -> Result<(Option<String>, Vec<Word>)> {
@@ -85,10 +277,75 @@ pub fn parse_whisper_json(json: &str) -> Result<(Option<String>, Vec<Word>)> {
             if t.is_empty() || t.starts_with('[') {
                 return None; // skips [MUSIC], [BLANK_AUDIO] markers
             }
-            Some(Word { s: seg["offsets"]["from"].as_f64()? / 1000.0, e: seg["offsets"]["to"].as_f64()? / 1000.0, t })
+            Some(Word { s: seg["offsets"]["from"].as_f64()? / 1000.0, e: seg["offsets"]["to"].as_f64()? / 1000.0, t, sp: 0, b: false })
         })
         .collect();
-    Ok((lang, words))
+    Ok((lang, drop_sound_tags(words)))
+}
+
+// ---------- speakers ----------
+
+/// Parses the separator's output lines: `0.318 -- 6.865 speaker_00`.
+pub fn parse_turns(text: &str) -> Vec<(f64, f64, u32)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let a = it.next()?.parse().ok()?;
+            (it.next()? == "--").then_some(())?;
+            let b = it.next()?.parse().ok()?;
+            let sp = it.next()?.strip_prefix("speaker_")?.parse().ok()?;
+            Some((a, b, sp))
+        })
+        .collect()
+}
+
+/// Separates speakers in a clip's audio. Turn times are relative to the clip.
+pub async fn diarize(tool: &crate::tools::SpeakerTool, video: &str, start: f64, dur: f64, work: &Path) -> Result<Vec<(f64, f64, u32)>> {
+    let wav = work.join("speakers.wav");
+    let out = hidden("ffmpeg")
+        .args(["-y", "-v", "error", "-ss", &format!("{start:.3}"), "-i", video, "-t", &format!("{dur:.3}"), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+        .arg(&wav)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!("couldn't extract clip audio: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let out = hidden(&tool.exe.to_string_lossy())
+        .arg(format!("--segmentation.pyannote-model={}", tool.segmentation.display()))
+        .arg(format!("--embedding.model={}", tool.embedding.display()))
+        .arg("--clustering.cluster-threshold=0.6")
+        .arg(&wav)
+        .output()
+        .await
+        .context("couldn't start the speaker engine")?;
+    if !out.status.success() {
+        return Err(anyhow!("speaker engine failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok(parse_turns(&text))
+}
+
+/// Gives each word the speaker it overlaps most, numbered by who talks first. Words outside
+/// every turn take the previous word's speaker.
+pub fn assign_speakers(words: &mut [Word], turns: &[(f64, f64, u32)], clip_start: f64) {
+    let mut order: Vec<u32> = Vec::new();
+    let mut last = 0u8;
+    for w in words.iter_mut() {
+        let (a, b) = (w.s - clip_start, w.e - clip_start);
+        let best = turns
+            .iter()
+            .map(|(s, e, sp)| ((b.min(*e) - a.max(*s)).max(0.0), *sp))
+            .filter(|(overlap, _)| *overlap > 0.0)
+            .max_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        if let Some((_, sp)) = best {
+            let idx = order.iter().position(|o| *o == sp).unwrap_or_else(|| {
+                order.push(sp);
+                order.len() - 1
+            });
+            last = idx as u8;
+        }
+        w.sp = last;
+    }
 }
 
 // ---------- audio + scene signals ----------
@@ -231,6 +488,59 @@ pub fn snap_to_pause(t: f64, words: &[Word], reach: f64, forward: bool) -> f64 {
     best.unwrap_or(t)
 }
 
+/// The transcript's words inside a clip, as stored on the clip.
+pub fn slice_words(words: &[Word], start: f64, end: f64) -> Vec<Word> {
+    words.iter().filter(|w| w.s >= start && w.s < end).cloned().collect()
+}
+
+/// Words for a clip after a trim: the clip's own words (with their edits and speakers) where
+/// it already had them, and the transcript's for anything newly included.
+pub fn retrim(own: &[Word], (old_s, old_e): (f64, f64), transcript: &[Word], start: f64, end: f64) -> Vec<Word> {
+    let mut out: Vec<Word> = slice_words(transcript, start, end).into_iter().filter(|w| w.s < old_s || w.s >= old_e).collect();
+    out.extend(slice_words(own, start, end));
+    out.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap());
+    out
+}
+
+/// Text for a clip, with bleeped words masked.
+pub fn words_text(words: &[Word]) -> String {
+    words.iter().map(|w| if w.b { crate::censor::mask(&w.t) } else { w.t.clone() }).collect::<Vec<_>>().join(" ")
+}
+
+/// Consecutive runs of one speaker, as index ranges.
+fn turns(words: &[Word]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        match out.last_mut() {
+            Some(r) if words[r.start].sp == w.sp => r.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
+}
+
+/// Replaces each speaker turn's text. A turn with the same word count keeps its timings and
+/// bleeps; one that changed spreads its new words evenly across the turn's time.
+pub fn retext(words: &[Word], texts: &[String]) -> Result<Vec<Word>> {
+    let spans = turns(words);
+    if spans.len() != texts.len() {
+        return Err(anyhow!("the clip changed; reopen the editor and try again"));
+    }
+    let mut out = Vec::with_capacity(words.len());
+    for (span, text) in spans.into_iter().zip(texts) {
+        let old = &words[span];
+        let new: Vec<&str> = text.split_whitespace().collect();
+        if new.len() == old.len() {
+            out.extend(old.iter().zip(&new).map(|(w, t)| Word { t: t.to_string(), ..w.clone() }));
+        } else {
+            let (a, b) = (old[0].s, old[old.len() - 1].e);
+            let step = (b - a) / new.len().max(1) as f64;
+            out.extend(new.iter().enumerate().map(|(i, t)| Word { s: a + i as f64 * step, e: a + (i + 1) as f64 * step, t: t.to_string(), sp: old[0].sp, b: t.contains('*') }));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
     pub start: f64,
@@ -368,11 +678,125 @@ fn capitalize(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn word(s: f64, t: &str) -> Word {
+        Word { s, e: s + 0.3, t: t.into(), sp: 0, b: false }
+    }
+
+    fn sentence(start: f64, t: &str) -> Vec<Word> {
+        t.split(' ').enumerate().map(|(i, x)| word(start + i as f64 * 0.4, x)).collect()
+    }
+
+    fn text(w: &[Word]) -> String {
+        w.iter().map(|x| x.t.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn sound_tags_are_dropped_but_words_stay() {
+        let w = sentence(0.0, "fire *laughs* *speaking in Spanish* Manny! (risas) ok sh*t");
+        assert_eq!(text(&drop_sound_tags(w)), "fire Manny! ok sh*t");
+    }
+
+    #[test]
+    fn trimming_keeps_edits_and_adds_transcript_words() {
+        let transcript = vec![word(10.0, "a"), word(20.0, "b"), word(30.0, "c")];
+        let own = vec![Word { sp: 2, ..word(20.0, "edited") }];
+        let w = retrim(&own, (15.0, 25.0), &transcript, 5.0, 25.0);
+        assert_eq!(text(&w), "a edited");
+        assert_eq!(w[1].sp, 2);
+    }
+
+    #[test]
+    fn same_length_edits_keep_timings_and_changed_turns_respread() {
+        let mut w = sentence(0.0, "uno dos tres cuatro");
+        w[2].sp = 1;
+        w[3].sp = 1;
+        w[0].b = true;
+        let out = retext(&w, &["one two".into(), "three".into()]).unwrap();
+        assert_eq!(text(&out), "one two three");
+        assert_eq!(out[1].s, w[1].s);
+        assert!(out[0].b, "bleep stays on an unchanged word");
+        assert_eq!((out[2].s, out[2].e, out[2].sp), (w[2].s, w[3].e, 1));
+        assert!(retext(&w, &["only one turn".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_speaker_turns_and_skips_other_output() {
+        let t = "Started\n0.318 -- 6.865 speaker_00\n7.0 -- 9.5 speaker_01\nElapsed seconds: 3.1\n";
+        assert_eq!(parse_turns(t), vec![(0.318, 6.865, 0), (7.0, 9.5, 1)]);
+    }
+
+    #[test]
+    fn words_take_the_speaker_they_overlap_most() {
+        let mut w = vec![word(101.0, "a"), word(102.0, "b"), word(103.0, "c"), word(120.0, "d")];
+        assign_speakers(&mut w, &[(0.0, 2.5, 7), (2.5, 5.0, 3)], 100.0);
+        let sp: Vec<u8> = w.iter().map(|x| x.sp).collect();
+        assert_eq!(sp, vec![0, 0, 1, 1], "first voice is 0; a word in no turn keeps the last speaker");
+    }
+
+    #[test]
+    fn looping_lines_collapse_to_two() {
+        let mut w = Vec::new();
+        for i in 0..8 {
+            w.extend(sentence(i as f64 * 5.0, "I'm gonna put the car here."));
+        }
+        assert_eq!(text(&drop_repeats(w)), "I'm gonna put the car here. I'm gonna put the car here.");
+    }
+
+    #[test]
+    fn real_repetition_is_kept() {
+        let s = "let's go let's go no no no no wait what";
+        assert_eq!(text(&drop_repeats(sentence(0.0, s))), s);
+    }
+
+    #[test]
+    fn long_single_word_loops_are_cut() {
+        let w = sentence(0.0, "yo yo yo yo yo yo yo yo yo okay");
+        assert_eq!(text(&drop_repeats(w)), "yo yo yo okay");
+    }
+
+    #[test]
+    fn pieces_join_on_the_recording_timeline_and_fix_empty_words() {
+        let a = (Some("en".to_string()), 0.0, vec![word(1.0, "one")]);
+        let b = (Some("es".to_string()), 180.0, vec![Word { s: 2.0, e: 2.0, t: "dos".into(), sp: 0, b: false }]);
+        let c = (Some("en".to_string()), 360.0, vec![word(0.5, "three")]);
+        let d = (Some("fr".to_string()), 540.0, vec![]);
+        let h = join_chunks(vec![a, b, c, d]);
+        let (lang, w) = (h.lang, h.words);
+        assert_eq!(lang.as_deref(), Some("en"));
+        assert_eq!(h.english, vec![(0.0, 2.3), (360.0, 361.8)], "spans of the English pieces only");
+        assert_eq!(w[1].s, 182.0);
+        assert!(w[1].e > w[1].s);
+        assert_eq!(w[2].s, 360.5);
+    }
+
+    #[test]
+    fn cuts_land_in_the_quiet_part() {
+        let mut pcm = vec![9000i16; 16000];
+        pcm[8000..9000].fill(0);
+        let at = quietest(&pcm);
+        assert!((8000..9000).contains(&at), "{at}");
+    }
+
+    #[test]
+    fn audio_splits_into_pieces_that_add_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("a.pcm");
+        let secs = 400usize;
+        let bytes: Vec<u8> = (0..secs * RATE).flat_map(|i| (((i % 200) * 100) as i16).to_le_bytes()).collect();
+        std::fs::write(&raw, &bytes).unwrap();
+        let chunks = split_audio(&raw, &dir.path().join("c")).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].1, 0.0);
+        assert!(chunks[1].1 > 170.0 && chunks[1].1 <= 180.0);
+        let total: u64 = chunks.iter().map(|c| std::fs::metadata(dir.path().join("c").join(&c.0)).unwrap().len() - 44).sum();
+        assert_eq!(total as usize, secs * RATE * 2, "no audio lost at the cuts");
+    }
+
     fn words_every(sec: f64, until: f64, text: &str) -> Vec<Word> {
         let mut out = vec![];
         let mut t = 0.0;
         while t < until {
-            out.push(Word { s: t, e: t + 0.3, t: text.into() });
+            out.push(Word { s: t, e: t + 0.3, t: text.into(), sp: 0, b: false });
             t += sec;
         }
         out
@@ -387,7 +811,7 @@ mod tests {
         let (lang, w) = parse_whisper_json(j).unwrap();
         assert_eq!(lang.as_deref(), Some("es"));
         assert_eq!(w.len(), 2);
-        assert_eq!(w[1], Word { s: 0.9, e: 1.3, t: "jajaja".into() });
+        assert_eq!(w[1], Word { s: 0.9, e: 1.3, t: "jajaja".into(), sp: 0, b: false });
     }
 
     #[test]
@@ -429,8 +853,8 @@ mod tests {
     #[test]
     fn edges_snap_to_pauses() {
         let words = vec![
-            Word { s: 10.0, e: 10.4, t: "a".into() },
-            Word { s: 12.0, e: 12.4, t: "b".into() }, // 1.6 s gap before this word
+            Word { s: 10.0, e: 10.4, t: "a".into(), sp: 0, b: false },
+            Word { s: 12.0, e: 12.4, t: "b".into(), sp: 0, b: false }, // 1.6 s gap before this word
         ];
         assert!((snap_to_pause(13.0, &words, 5.0, false) - 11.75).abs() < 1e-9);
         assert!((snap_to_pause(9.0, &words, 5.0, true) - 10.65).abs() < 1e-9);
@@ -440,9 +864,9 @@ mod tests {
     #[test]
     fn laughter_and_spanish_hype_are_detected() {
         let words = vec![
-            Word { s: 1.0, e: 1.2, t: "jajaja".into() },
-            Word { s: 2.0, e: 2.2, t: "no".into() },
-            Word { s: 2.2, e: 2.4, t: "mames".into() },
+            Word { s: 1.0, e: 1.2, t: "jajaja".into(), sp: 0, b: false },
+            Word { s: 2.0, e: 2.2, t: "no".into(), sp: 0, b: false },
+            Word { s: 2.2, e: 2.4, t: "mames".into(), sp: 0, b: false },
         ];
         let sec = features(5.0, &[], &words, &[]);
         assert_eq!(sec[1].laugh, 1.0);

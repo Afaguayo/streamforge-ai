@@ -121,6 +121,34 @@ pub struct Metadata {
     pub tags: Vec<String>,
 }
 
+pub struct VideoPackage {
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub thumb_text: String,
+}
+
+/// Title, description, tags and thumbnail wording for a full stream upload.
+pub async fn video_package(stream_title: &str, highlights: &str) -> Result<VideoPackage> {
+    let system = "You package a livestreamer's full stream for YouTube. Sound like a person, not an AI: no 'Dive into', no emoji spam, \
+no keyword stuffing, no claims the highlights don't support. Use the highlights' language. \
+title: specific and curiosity-driven, built on what actually happened, under 70 characters, no hashtags. \
+description: 2-3 short paragraphs on what happens. Don't add links or a call to follow, they're added later. \
+tags: 8-15 search tags without #. \
+thumb_text: 2 to 4 punchy words for the thumbnail, different from the title. \
+Text with stars is censored: never spell out or hint at a censored word.";
+    let user = format!("Stream title on Kick: {stream_title}\nHighlights from the transcript:\n{highlights}");
+    let schema = json!({ "type": "object", "additionalProperties": false, "required": ["title","description","tags","thumb_text"],
+        "properties": { "title": {"type":"string"}, "description": {"type":"string"}, "tags": {"type":"array","items":{"type":"string"}}, "thumb_text": {"type":"string"} } });
+    let v = call_json(system, &user, schema).await?;
+    Ok(VideoPackage {
+        title: v["title"].as_str().unwrap_or(stream_title).into(),
+        description: v["description"].as_str().unwrap_or("").into(),
+        tags: v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
+        thumb_text: v["thumb_text"].as_str().unwrap_or("").into(),
+    })
+}
+
 /// Platform-specific title, caption and hashtags for one clip or full video.
 pub async fn metadata(platform: &str, transcript: &str, current_title: &str, full_video: bool) -> Result<Metadata> {
     let kind = if full_video { "full livestream upload" } else { "short vertical clip" };

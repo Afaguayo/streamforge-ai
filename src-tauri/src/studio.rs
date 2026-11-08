@@ -1,6 +1,6 @@
 //! Tauri commands for Clip Studio, Thumbnail Studio, publishing, analytics and research.
 
-use crate::{posts, settings::Settings, tools, AppState};
+use crate::{analysis, kick, pipeline, posts, settings::Settings, tools, AppState};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
@@ -22,13 +22,20 @@ pub struct Engine {
     status: tools::EngineStatus,
     claude: bool,
     installing: bool,
+    installing_speakers: bool,
 }
 
 #[tauri::command]
 pub fn engine_status(st: State<AppState>) -> Res<Engine> {
     let model = Settings::load(&st.db).whisper_model;
     let installing: i64 = st.db.conn().query_row("SELECT COUNT(*) FROM jobs WHERE kind='install_whisper' AND status IN ('queued','running')", [], |r| r.get(0)).map_err(q)?;
-    Ok(Engine { status: tools::status(&st.data_dir, &model), claude: crate::llm::available(), installing: installing > 0 })
+    let speakers: i64 = st.db.conn().query_row("SELECT COUNT(*) FROM jobs WHERE kind='install_speakers' AND status IN ('queued','running')", [], |r| r.get(0)).map_err(q)?;
+    Ok(Engine { status: tools::status(&st.data_dir, &model), claude: crate::llm::available(), installing: installing > 0, installing_speakers: speakers > 0 })
+}
+
+#[tauri::command]
+pub fn install_speakers(st: State<AppState>) -> Res<i64> {
+    st.db.enqueue("install_speakers", None, "{}").map_err(e)
 }
 
 #[tauri::command]
@@ -39,7 +46,7 @@ pub fn install_engine(st: State<AppState>) -> Res<i64> {
 /// Re-runs transcription (and everything after it) for a recording.
 #[tauri::command]
 pub fn process_stream(st: State<AppState>, id: i64) -> Res<i64> {
-    let has_transcript: i64 = st.db.conn().query_row("SELECT COUNT(*) FROM transcripts WHERE stream_id=?1", [id], |r| r.get(0)).map_err(q)?;
+    let has_transcript: i64 = st.db.conn().query_row("SELECT COUNT(*) FROM transcripts WHERE stream_id=?1 AND engine>=2", [id], |r| r.get(0)).map_err(q)?;
     st.db.enqueue(if has_transcript > 0 { "analyze" } else { "transcribe" }, Some(id), "{}").map_err(e)
 }
 
@@ -66,6 +73,7 @@ pub struct Clip {
     cover_path: Option<String>,
     error: Option<String>,
     posts: Vec<(String, String)>, // (platform, status)
+    words: Vec<analysis::Word>,
 }
 
 #[tauri::command]
@@ -75,7 +83,7 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
         .prepare(
             "SELECT c.id,c.stream_id,s.title,c.start_s,c.end_s,c.score,c.scores,c.category,c.title,c.hook,c.reason,c.transcript,c.scored_by,
              c.status,c.render_status,c.render_path,c.cover_path,c.error,
-             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id)
+             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id), c.words
              FROM clips c JOIN streams s ON s.id=c.stream_id ORDER BY c.stream_id DESC, c.score DESC",
         )
         .map_err(q)?;
@@ -88,6 +96,7 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
                 hook: r.get(9)?, reason: r.get(10)?, transcript: r.get(11)?, scored_by: r.get(12)?, status: r.get(13)?,
                 render_status: r.get(14)?, render_path: r.get(15)?, cover_path: r.get(16)?, error: r.get(17)?,
                 posts: posts.unwrap_or_default().split(',').filter(|x| !x.is_empty()).filter_map(|x| x.split_once(':')).map(|(a, b)| (a.into(), b.into())).collect(),
+                words: r.get::<_, Option<String>>(19)?.and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default(),
             })
         })
         .map_err(q)?;
@@ -112,17 +121,28 @@ pub fn restore_clip(st: State<AppState>, id: i64) -> Res<()> {
     Ok(())
 }
 
-/// Edits trims/title/hook and re-renders. Clips stay within 60–120 s.
+/// Clips you edit by hand can be shorter or longer than the ones found automatically.
+const EDIT_MIN: f64 = 5.0;
+const EDIT_MAX: f64 = 180.0;
+
+/// Edits trims/title/hook and re-renders.
 #[tauri::command]
 pub fn edit_clip(st: State<AppState>, id: i64, start: f64, end: f64, title: String, hook: String) -> Res<()> {
     let len = end - start;
-    if !(crate::analysis::MIN_CLIP - 0.01..=crate::analysis::MAX_CLIP + 0.01).contains(&len) || start < 0.0 {
-        return Err(format!("clips must be 60–120 s long (this would be {len:.0} s)"));
+    if !(EDIT_MIN - 0.01..=EDIT_MAX + 0.01).contains(&len) || start < 0.0 {
+        return Err(format!("clips can be {EDIT_MIN:.0}–{EDIT_MAX:.0} s long (this would be {len:.0} s)"));
     }
-    let dur: Option<f64> = st.db.conn().query_row("SELECT s.duration_s FROM clips c JOIN streams s ON s.id=c.stream_id WHERE c.id=?1", [id], |r| r.get(0)).map_err(q)?;
+    let (sid, old_s, old_e, dur): (i64, f64, f64, Option<f64>) = st.db.conn().query_row(
+        "SELECT c.stream_id, c.start_s, c.end_s, s.duration_s FROM clips c JOIN streams s ON s.id=c.stream_id WHERE c.id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).map_err(q)?;
     if dur.is_some_and(|d| end > d + 0.5) {
         return Err("the clip can't end after the recording does".into());
     }
+    let own = pipeline::clip_words(&st.db, id, sid, old_s, old_e);
+    let transcript = pipeline::load_words(&st.db, sid).unwrap_or_default();
+    pipeline::save_clip_words(&st.db, id, &analysis::retrim(&own, (old_s, old_e), &transcript, start, end)).map_err(e)?;
     st.db.conn().execute(
         "UPDATE clips SET start_s=?2, end_s=?3, title=?4, hook=?5 WHERE id=?1",
         rusqlite::params![id, start, end, title.trim(), hook.trim()],
@@ -130,9 +150,77 @@ pub fn edit_clip(st: State<AppState>, id: i64, start: f64, end: f64, title: Stri
     posts::queue_render(&st.db, id).map_err(e)
 }
 
+fn own_words(st: &AppState, id: i64) -> Res<Vec<analysis::Word>> {
+    let (sid, start, end): (i64, f64, f64) = st.db.conn().query_row("SELECT stream_id,start_s,end_s FROM clips WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(q)?;
+    Ok(pipeline::clip_words(&st.db, id, sid, start, end))
+}
+
+/// Replaces the captions, one text per speaker turn, and re-renders.
+#[tauri::command]
+pub fn edit_clip_text(st: State<AppState>, id: i64, turns: Vec<String>) -> Res<()> {
+    let words = analysis::retext(&own_words(&st, id)?, &turns).map_err(e)?;
+    pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
+    posts::queue_render(&st.db, id).map_err(e)
+}
+
+/// Bleeps a word the censor missed, or un-bleeps one it got wrong. Applies on the next render.
+#[tauri::command]
+pub fn toggle_bleep(st: State<AppState>, id: i64, index: usize) -> Res<()> {
+    let mut words = own_words(&st, id)?;
+    let w = words.get_mut(index).ok_or("that word no longer exists")?;
+    w.b = !w.b;
+    pipeline::save_clip_words(&st.db, id, &words).map_err(e)
+}
+
+/// Copies a finished clip to where you chose.
+#[tauri::command]
+pub fn download_clip(st: State<AppState>, id: i64, dest: String) -> Res<()> {
+    let path: Option<String> = st.db.conn().query_row("SELECT render_path FROM clips WHERE id=?1", [id], |r| r.get(0)).map_err(q)?;
+    let path = path.ok_or("render the clip first")?;
+    std::fs::copy(&path, &dest).map_err(|err| format!("couldn't save the clip: {err}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn render_clip(st: State<AppState>, id: i64) -> Res<()> {
     posts::queue_render(&st.db, id).map_err(e)
+}
+
+// ---------- Kick VODs ----------
+
+#[derive(Serialize)]
+pub struct KickVod {
+    #[serde(flatten)]
+    vod: kick::Vod,
+    /// The library entry for this VOD, if it's already there.
+    stream_id: Option<i64>,
+}
+
+/// Past broadcasts on your Kick channel, newest first.
+#[tauri::command]
+pub async fn list_kick_vods(st: State<'_, AppState>) -> Res<Vec<KickVod>> {
+    let slug = Settings::load(&st.db).kick_channel_slug.ok_or("Set your Kick channel name first")?;
+    let vods = kick::list_vods(&slug).await.map_err(e)?;
+    let conn = st.db.conn();
+    Ok(vods
+        .into_iter()
+        .map(|vod| {
+            let stream_id = conn.query_row("SELECT id FROM streams WHERE kick_vod_id=?1", [&vod.id], |r| r.get(0)).ok();
+            KickVod { vod, stream_id }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn import_kick_vod(st: State<AppState>, vod: kick::Vod) -> Res<i64> {
+    kick::add_vod(&st.db, &vod).map_err(e)
+}
+
+/// Imports a VOD from a pasted kick.com link.
+#[tauri::command]
+pub async fn import_kick_link(st: State<'_, AppState>, link: String) -> Res<i64> {
+    let vod = kick::vod_from_link(&link).await.map_err(e)?;
+    kick::add_vod(&st.db, &vod).map_err(e)
 }
 
 // ---------- thumbnails ----------

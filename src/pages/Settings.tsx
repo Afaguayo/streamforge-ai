@@ -92,6 +92,15 @@ export default function SettingsPage() {
               </select>
             </Field>
             <ClaudeKey onMsg={setMsg} />
+            <div className="flex items-center justify-between gap-4 rounded-lg bg-ink-950 px-4 py-3">
+              <div className="text-sm">
+                <div className="font-medium">Speaker colors</div>
+                <div className="mt-0.5 text-ink-500">
+                  {engine?.status.speakers_installed ? "Installed. Each voice in a clip gets its own color in the captions and transcript." : engine?.installing_speakers ? "Installing… progress shows on the Dashboard." : "Optional, about 100 MB, runs on your PC. Downloads sherpa-onnx from GitHub. Game audio and overlapping voices can confuse it."}
+                </div>
+              </div>
+              {engine?.status.speakers_installed ? <Badge tone="good">Ready</Badge> : <Button disabled={engine?.installing_speakers} onClick={async () => { await api.installSpeakers(); setMsg({ tone: "good", text: "Installing speaker detection…" }); }}><Download size={14} /> Install</Button>}
+            </div>
             <Field label="Render the best clips automatically" hint="So they're ready to review when you wake up. 0 = render only when you approve.">
               <input type="number" min={0} max={20} className={`${inputCls} w-32`} value={s.auto_render_top} onChange={(e) => set({ auto_render_top: Number(e.target.value) })} />
             </Field>
@@ -115,6 +124,48 @@ export default function SettingsPage() {
               </Field>
             )}
             <Toggle checked={s.subtitles} onChange={(v) => set({ subtitles: v })} label="Animated word-by-word captions" hint="Large, high-contrast and placed above where TikTok/Shorts put their buttons." />
+          </div>
+        </Card>
+
+        <Card title="Censor">
+          <div className="space-y-5">
+            <Toggle checked={s.censor_enabled} onChange={(v) => set({ censor_enabled: v })} label="Censor the N-word" hint="Masks it in transcripts and captions and bleeps it in clips and full stream uploads. It relies on speech recognition, which can miss a word, so check anything going public. You can bleep extra words by hand in a clip's transcript." />
+            {s.censor_enabled && (
+              <>
+                <Field label="Sound">
+                  <select className={`${inputCls} w-72`} value={s.censor_style} onChange={(e) => set({ censor_style: e.target.value as Settings["censor_style"] })}>
+                    <option value="beep">Beep</option>
+                    <option value="mute">Silence</option>
+                  </select>
+                </Field>
+                <Field label="Other words to censor" hint="Whole words, separated by commas. Applies to streams transcribed after saving.">
+                  <input className={inputCls} value={s.censor_words.join(", ")} onChange={(e) => set({ censor_words: e.target.value.split(",").map((w) => w.trimStart()) })} />
+                </Field>
+              </>
+            )}
+          </div>
+        </Card>
+
+        <Card title="Full streams">
+          <div className="space-y-5">
+            <Toggle checked={s.auto_upload_vod} onChange={(v) => set({ auto_upload_vod: v })} label="Upload each Kick stream to YouTube automatically" hint="After a stream ends: uses your OBS recording if there is one, otherwise downloads the VOD from Kick, then censors it, makes the thumbnail and title, and uploads. Past VODs you add by hand aren't uploaded unless you ask." />
+            <Field label="Privacy for those uploads" hint="YouTube keeps uploads private until Google audits the app, whatever you pick here.">
+              <select className={`${inputCls} w-72`} value={s.vod_privacy} onChange={(e) => set({ vod_privacy: e.target.value as Settings["vod_privacy"] })}>
+                <option value="private">Private</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="public">Public</option>
+              </select>
+            </Field>
+            <Field label="Links in YouTube descriptions" hint="A handle or a full link. Added to full streams and Shorts. Empty Kick and TikTok use your connected accounts.">
+              <div className="grid grid-cols-2 gap-3">
+                {([["kick", "Kick"], ["tiktok", "TikTok"], ["instagram", "Instagram"], ["x", "X"], ["discord", "Discord invite"]] as const).map(([k, label]) => (
+                  <label key={k} className="text-xs text-ink-500">
+                    {label}
+                    <input className={`${inputCls} mt-1`} value={s.socials[k]} onChange={(e) => set({ socials: { ...s.socials, [k]: e.target.value } })} />
+                  </label>
+                ))}
+              </div>
+            </Field>
           </div>
         </Card>
 

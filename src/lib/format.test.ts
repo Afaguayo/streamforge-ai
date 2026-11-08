@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ago, bytes, duration } from "./format";
+import { remaining, ago, bytes, duration } from "./format";
 
 describe("format", () => {
   it("formats durations", () => {
@@ -19,5 +19,15 @@ describe("format", () => {
     expect(ago("2026-10-29T11:30:00Z", now)).toBe("30 min ago");
     expect(ago("2026-10-27T12:00:00Z", now)).toBe("2 d ago");
     expect(ago(null, now)).toBe("never");
+  });
+});
+
+describe("remaining", () => {
+  it("projects from the speed so far", () => {
+    expect(remaining(0.5, 0.25, 0, 100_000)).toBeCloseTo(200);
+  });
+  it("stays quiet until there is enough to go on", () => {
+    expect(remaining(0.2, 0.2, 0, 60_000)).toBeNull();
+    expect(remaining(0.5, 0.2, 0, 5_000)).toBeNull();
   });
 });

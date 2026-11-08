@@ -5,6 +5,7 @@ import {
   Cable,
   Clapperboard,
   Film,
+  Gauge,
   Image,
   LayoutDashboard,
   ListChecks,
@@ -27,10 +28,12 @@ import Calendar from "./pages/Calendar";
 import UploadQueue from "./pages/UploadQueue";
 import Analytics from "./pages/Analytics";
 import Setup from "./pages/Setup";
+import ProgressPage from "./pages/Progress";
+import { ProgressDock, useProgress } from "./components/Progress";
 import { api } from "./lib/api";
 
 export type PageId =
-  | "dashboard" | "live" | "library" | "clips" | "thumbnails" | "trends"
+  | "dashboard" | "progress" | "live" | "library" | "clips" | "thumbnails" | "trends"
   | "competitors" | "calendar" | "uploads" | "analytics" | "connections" | "settings" | "setup";
 
 const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Film }[] }[] = [
@@ -38,6 +41,7 @@ const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Fil
     group: "Overview",
     items: [
       { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+      { id: "progress", label: "Progress", icon: Gauge },
       { id: "live", label: "Live Stream Monitor", icon: Radio },
       { id: "library", label: "Video Library", icon: Film },
     ],
@@ -76,6 +80,7 @@ const NAV: { group: string; items: { id: PageId; label: string; icon: typeof Fil
 
 export default function App() {
   const [page, setPage] = useState<PageId>("dashboard");
+  const progress = useProgress();
 
   // First launch opens the setup wizard until it's finished or skipped.
   useEffect(() => {
@@ -108,10 +113,12 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.2.0</div>
+        <ProgressDock p={progress} go={setPage} />
+        <div className="border-t border-ink-800 px-5 py-3 text-[11px] text-ink-500">v0.3.0</div>
       </aside>
       <main className="flex-1 overflow-y-auto">
         {page === "dashboard" && <Dashboard go={setPage} />}
+        {page === "progress" && <ProgressPage p={progress} />}
         {page === "live" && <LiveMonitor go={setPage} />}
         {page === "library" && <Library go={setPage} />}
         {page === "connections" && <Connections />}

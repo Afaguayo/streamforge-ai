@@ -27,9 +27,10 @@ export type Stream = {
   fps: number | null;
   video_codec: string | null;
   audio_codec: string | null;
-  status: "live" | "awaiting_file" | "queued" | "probed" | "transcribed" | "analyzed" | "error";
+  status: "live" | "awaiting_file" | "downloading" | "queued" | "probed" | "transcribed" | "analyzed" | "error";
   error: string | null;
   created_at: string;
+  kick_vod_id: string | null;
 };
 
 export type Job = {
@@ -78,11 +79,24 @@ export type Settings = {
   default_privacy: "private" | "unlisted" | "public";
   auto_publish: boolean;
   posts_per_day: number;
+  censor_enabled: boolean;
+  censor_style: "beep" | "mute";
+  censor_words: string[];
+  auto_upload_vod: boolean;
+  vod_privacy: "private" | "unlisted" | "public";
+  socials: Socials;
 };
 
-export type Engine = { status: { whisper_installed: boolean; model_installed: boolean; model: string }; claude: boolean; installing: boolean };
+export type Socials = { kick: string; tiktok: string; instagram: string; x: string; discord: string };
+
+export type KickVod = { id: string; title: string; started_at: string; duration_s: number; source: string; thumbnail: string | null; stream_id: number | null };
+
+export type Engine = { status: { whisper_installed: boolean; model_installed: boolean; model: string; speakers_installed: boolean }; claude: boolean; installing: boolean; installing_speakers: boolean };
 
 export type Scores = { hook: number; entertainment: number; emotion: number; context: number; replay: number; shareability: number; trend: number; total: number };
+
+/// A caption word. `sp` is the speaker number within the clip, `b` means it's bleeped.
+export type Word = { s: number; e: number; t: string; sp: number; b: boolean };
 
 export type Clip = {
   id: number;
@@ -104,6 +118,7 @@ export type Clip = {
   cover_path: string | null;
   error: string | null;
   posts: [string, string][];
+  words: Word[];
 };
 
 export type Thumb = { id: number; stream_id: number; stream_title: string; path: string; rank: number; concept: string; selected: boolean };
@@ -228,12 +243,19 @@ export const api = {
   disconnect: (platform: string) => invoke<void>("disconnect_account", { platform }),
   engine: () => invoke<Engine>("engine_status"),
   installEngine: () => invoke<number>("install_engine"),
+  installSpeakers: () => invoke<number>("install_speakers"),
   processStream: (id: number) => invoke<number>("process_stream", { id }),
   clips: () => invoke<Clip[]>("list_clips"),
   approveClip: (id: number) => invoke<string[]>("approve_clip", { id }),
   rejectClip: (id: number) => invoke<void>("reject_clip", { id }),
   restoreClip: (id: number) => invoke<void>("restore_clip", { id }),
   editClip: (id: number, start: number, end: number, title: string, hook: string) => invoke<void>("edit_clip", { id, start, end, title, hook }),
+  editClipText: (id: number, turns: string[]) => invoke<void>("edit_clip_text", { id, turns }),
+  toggleBleep: (id: number, index: number) => invoke<void>("toggle_bleep", { id, index }),
+  downloadClip: (id: number, dest: string) => invoke<void>("download_clip", { id, dest }),
+  kickVods: () => invoke<KickVod[]>("list_kick_vods"),
+  importKickVod: (vod: KickVod) => invoke<number>("import_kick_vod", { vod }),
+  importKickLink: (link: string) => invoke<number>("import_kick_link", { link }),
   renderClip: (id: number) => invoke<void>("render_clip", { id }),
   thumbnails: () => invoke<Thumb[]>("list_thumbnails"),
   selectThumbnail: (id: number) => invoke<void>("select_thumbnail", { id }),

@@ -47,6 +47,15 @@
 - [x] Opt-in full automation: best clips approved and scheduled N per day
 - [ ] TikTok stats (needs audited app + video.list)
 
+## v0.3 — Clean transcripts, censor, Kick VODs
+- [x] Chunked transcription: per-piece language, voice detection, repeat removal; old transcripts redone at startup
+- [x] Recordings attach to the session they were written during
+- [x] Kick VOD download when a stream has no recording; past VODs from a list or a link
+- [x] Auto-censor: masked text, bleeped audio in clips and full streams, custom words, hand bleeps
+- [x] Automatic full stream upload with thumbnail, title and social links in the description
+- [x] Clip download, caption editing, 5–180 s manual trims
+- [x] Speaker colors in captions and transcript (optional sherpa-onnx install)
+
 ## Phase 7 — Hardening
 - [x] Disk-space monitor (pauses below 2 GB), temp-file cleanup
 - [ ] Auto-update (Tauri updater + signed releases)
