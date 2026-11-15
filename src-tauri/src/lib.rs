@@ -56,7 +56,7 @@ pub fn run() {
             if let Err(e) = media::end_helpers_with_app() {
                 db.log("warn", "app", &format!("Helpers may outlive the app: {e:#}"));
             }
-            pipeline::redo_old_transcripts(&db)?;
+            pipeline::redo_old_transcripts(&db, &data_dir)?;
             db.log("info", "app", &format!("Started; {resumed} interrupted job(s) resumed"));
 
             let kick_state = Arc::new(Mutex::new(kick::KickState::default()));

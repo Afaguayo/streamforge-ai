@@ -169,7 +169,7 @@ fn own_words(st: &AppState, id: i64) -> Res<Vec<analysis::Word>> {
 /// Replaces the captions, one text per speaker turn, and re-renders.
 #[tauri::command]
 pub fn edit_clip_text(st: State<AppState>, id: i64, turns: Vec<String>) -> Res<()> {
-    let words = analysis::retext(&own_words(&st, id)?, &turns).map_err(e)?;
+    let words = analysis::retext(&own_words(&st, id)?, &turns, &crate::settings::Settings::load(&st.db).censor_words).map_err(e)?;
     pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
     drop_bleeped_copy(&st, id)?;
     posts::queue_render(&st.db, id).map_err(e)
