@@ -208,6 +208,31 @@ pub fn create_manual_clip(db: &crate::db::Db, stream_id: i64, start: f64, end: f
     Ok(id)
 }
 
+#[derive(Serialize)]
+pub struct Cuts {
+    /// Found automatically: stretches with no talking and little going on.
+    auto: Vec<(f64, f64)>,
+    /// Marked by you in the Clip Picker.
+    manual: Vec<(f64, f64)>,
+}
+
+#[tauri::command]
+pub fn stream_cuts(st: State<AppState>, id: i64) -> Res<Cuts> {
+    let auto: Option<String> = st.db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [id], |r| r.get(0)).map_err(q)?;
+    Ok(Cuts { auto: auto.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(), manual: pipeline::manual_cuts(&st.db, id) })
+}
+
+/// Adds or removes a stretch you want cut from the full upload.
+#[tauri::command]
+pub fn set_manual_cuts(st: State<AppState>, id: i64, cuts: Vec<(f64, f64)>) -> Res<()> {
+    if cuts.iter().any(|(a, b)| b <= a || *a < 0.0) {
+        return Err("each cut needs an end after its start".into());
+    }
+    let merged = crate::censor::merge(cuts);
+    st.db.conn().execute("UPDATE streams SET manual_cuts=?2, censored_path=NULL WHERE id=?1", rusqlite::params![id, serde_json::to_string(&merged).map_err(|err| err.to_string())?]).map_err(q)?;
+    Ok(())
+}
+
 /// Copies a finished clip to where you chose.
 #[tauri::command]
 pub fn download_clip(st: State<AppState>, id: i64, dest: String) -> Res<()> {

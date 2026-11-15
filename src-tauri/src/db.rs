@@ -175,6 +175,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE streams ADD COLUMN cuts TEXT;                      -- JSON [[start_s, end_s], ...]
     "#,
+    // 7: cuts you choose, and the parts of the recording the upload kept (for subtitle timing)
+    r#"
+    ALTER TABLE streams ADD COLUMN manual_cuts TEXT NOT NULL DEFAULT '[]'; -- JSON [[start_s, end_s], ...]
+    ALTER TABLE streams ADD COLUMN upload_parts TEXT;              -- JSON [[start_s, end_s], ...]
+    "#,
 ];
 
 pub struct Db(Mutex<Connection>);
