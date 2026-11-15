@@ -129,13 +129,39 @@ pub fn split_audio(raw: &Path, dir: &Path) -> Result<Vec<(String, f64)>> {
 /// The threshold is below the default of 0.5, which dropped half the speech on a stretch of
 /// friends talking over game audio. Without `vad` every moment is transcribed: more
 /// repeats and worse timings, but it hears some words the other misses.
+///
+/// With `vad`, the non-speech parts of each piece are silenced rather than cut out. whisper's
+/// own `--vad` cuts them out and maps times back, but its timings on the shortened audio are
+/// off by up to a second, and a second there can cross a removed 10 s pause: captions showed
+/// up 14 s before the words. Silencing keeps every time on the real timeline.
 pub async fn run_whisper(exe: &Path, model: &Path, vad: Option<&Path>, dir: &Path, chunks: &[(String, f64)], mut progress: impl FnMut(f64)) -> Result<Heard> {
     let threads = std::thread::available_parallelism().map(|n| (n.get() / 2).max(2)).unwrap_or(4).to_string();
+    let detector = exe.with_file_name("whisper-vad-speech-segments.exe");
+    // Per piece: the file whisper reads, its start time, and its speech (None: not known).
+    let mut inputs: Vec<(String, f64, Option<Vec<(f64, f64)>>)> = Vec::new();
+    match vad {
+        Some(vad) if detector.is_file() => {
+            for (name, start) in chunks {
+                let regions = speech_regions(&detector, vad, &dir.join(name)).await?;
+                if regions.is_empty() {
+                    continue; // nothing said in this piece
+                }
+                let quiet = format!("m{name}");
+                mute_outside(&dir.join(name), &dir.join(&quiet), &regions)?;
+                inputs.push((quiet, *start, Some(regions)));
+            }
+            if inputs.is_empty() {
+                return Err(anyhow!("speech engine wrote no transcript"));
+            }
+        }
+        _ => inputs = chunks.iter().map(|(n, s)| (n.clone(), *s, None)).collect(),
+    }
     let mut cmd = hidden(&exe.to_string_lossy());
     // Short relative names: hundreds of pieces must fit on one command line.
-    cmd.current_dir(dir).arg("-m").arg(model).arg("-f").args(chunks.iter().map(|c| &c.0));
+    cmd.current_dir(dir).arg("-m").arg(model).arg("-f").args(inputs.iter().map(|c| &c.0));
     cmd.args(["-l", "auto", "-mc", "0"]);
-    if let Some(vad) = vad {
+    if let (Some(vad), false) = (vad, detector.is_file()) {
+        // Older engine without the detector tool: let whisper cut the silence itself.
         cmd.args(["--vad", "-vt", "0.35", "-vm"]).arg(vad);
     }
     let mut child = cmd
@@ -154,7 +180,7 @@ pub async fn run_whisper(exe: &Path, model: &Path, vad: Option<&Path>, dir: &Pat
                     done += 1; // progress restarts for each input file
                 }
                 last = p;
-                progress(((done as f64 + p / 100.0) / chunks.len().max(1) as f64).min(1.0));
+                progress(((done as f64 + p / 100.0) / inputs.len().max(1) as f64).min(1.0));
             }
             tail.push(line);
             if tail.len() > 20 {
@@ -167,10 +193,13 @@ pub async fn run_whisper(exe: &Path, model: &Path, vad: Option<&Path>, dir: &Pat
         return Err(anyhow!("speech engine failed: {}", tail.join(" | ")));
     }
     let mut parts = Vec::new();
-    for (name, start) in chunks {
+    for (name, start, regions) in &inputs {
         // A piece with no speech writes no transcript.
         if let Ok(json) = std::fs::read_to_string(dir.join(format!("{name}.json"))) {
-            let (lang, words) = parse_whisper_json(&json)?;
+            let (lang, mut words) = parse_whisper_json(&json)?;
+            if let Some(r) = regions {
+                words = fit_to_speech(words, r);
+            }
             parts.push((lang, *start, words));
         }
     }
@@ -178,6 +207,107 @@ pub async fn run_whisper(exe: &Path, model: &Path, vad: Option<&Path>, dir: &Pat
         return Err(anyhow!("speech engine wrote no transcript"));
     }
     Ok(join_chunks(parts))
+}
+
+/// The stretches of speech in one piece, in seconds, from whisper.cpp's voice detector with
+/// the same settings `--vad` used.
+async fn speech_regions(detector: &Path, vad: &Path, wav: &Path) -> Result<Vec<(f64, f64)>> {
+    let out = hidden(&detector.to_string_lossy())
+        .arg("-f")
+        .arg(wav)
+        .arg("-vm")
+        .arg(vad)
+        .args(["-vt", "0.35", "-np"])
+        .output()
+        .await
+        .context("couldn't start the voice detector")?;
+    if !out.status.success() {
+        return Err(anyhow!("voice detector failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(parse_speech_regions(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Reads the detector's lines, `Speech segment 0: start = 106.00, end = 185.00`, which are in
+/// hundredths of a second.
+pub fn parse_speech_regions(text: &str) -> Vec<(f64, f64)> {
+    text.lines()
+        .filter_map(|l| {
+            let num = |key: &str| l.split(key).nth(1)?.split(',').next()?.trim().parse::<f64>().ok();
+            Some((num("start =")? / 100.0, num("end =")? / 100.0))
+        })
+        .collect()
+}
+
+/// Copies a piece written by `split_audio` with everything outside `regions` set to silence.
+fn mute_outside(src: &Path, dst: &Path, regions: &[(f64, f64)]) -> Result<()> {
+    let bytes = std::fs::read(src)?;
+    let pcm = bytes.get(44..).unwrap_or_default();
+    let n = pcm.len() / 2;
+    let mut out = wav_header(n);
+    out.resize(44 + n * 2, 0);
+    for &(a, b) in regions {
+        let (i, j) = (((a * RATE as f64) as usize).min(n), ((b * RATE as f64) as usize).min(n));
+        if i < j {
+            out[44 + 2 * i..44 + 2 * j].copy_from_slice(&pcm[2 * i..2 * j]);
+        }
+    }
+    std::fs::write(dst, out)?;
+    Ok(())
+}
+
+/// Keeps each word inside the stretch of speech it belongs to (the one it overlaps most, or
+/// the nearest): it can't start before that speech or run on into the silence after it.
+/// Words whisper stacked on one instant are pushed apart (0.12 s each, less if the speech is
+/// too short), so captions appear one by one instead of all at once.
+pub fn fit_to_speech(mut words: Vec<Word>, regions: &[(f64, f64)]) -> Vec<Word> {
+    if regions.is_empty() {
+        return words;
+    }
+    // Overlap with a region, or minus the gap to it when they don't touch.
+    let home: Vec<usize> = words
+        .iter()
+        .map(|w| {
+            let fit = |r: &(f64, f64)| w.e.max(w.s).min(r.1) - w.s.max(r.0);
+            (0..regions.len()).max_by(|&a, &b| fit(&regions[a]).total_cmp(&fit(&regions[b]))).unwrap_or(0)
+        })
+        .collect();
+    for (r, &(a, b)) in regions.iter().enumerate() {
+        let idx: Vec<usize> = (0..words.len()).filter(|&i| home[i] == r).collect();
+        for &i in &idx {
+            words[i].s = words[i].s.max(a).min(b);
+        }
+        // A stack shares the time up to the next word.
+        let mut k = 0;
+        while k < idx.len() {
+            let s = words[idx[k]].s;
+            let m = (k + 1..idx.len()).find(|&m| words[idx[m]].s != s).unwrap_or(idx.len());
+            if m - k > 1 {
+                let end = match idx.get(m) {
+                    Some(&n) => words[n].s,
+                    None => idx[k..m].iter().map(|&i| words[i].e).fold(s, f64::max).min(b),
+                };
+                let step = (end - s).max(0.0) / (m - k) as f64;
+                for (n, &i) in idx[k..m].iter().enumerate() {
+                    words[i].s = s + step * n as f64;
+                    words[i].e = words[i].s + step;
+                }
+            }
+            k = m;
+        }
+        let gap = 0.12f64.min((b - a) / idx.len().max(1) as f64);
+        let mut prev = f64::NEG_INFINITY;
+        for &i in &idx {
+            words[i].s = words[i].s.max(prev + gap);
+            prev = words[i].s;
+        }
+        let mut next = b;
+        for &i in idx.iter().rev() {
+            words[i].s = words[i].s.min(next - gap);
+            words[i].e = words[i].e.max(words[i].s + gap).min(next);
+            next = words[i].s;
+        }
+    }
+    words
 }
 
 /// A joined transcript.
@@ -932,6 +1062,52 @@ mod tests {
         assert_eq!(w[1].s, 182.0);
         assert!(w[1].e > w[1].s);
         assert_eq!(w[2].s, 360.5);
+    }
+
+    #[test]
+    fn reads_the_voice_detector_output() {
+        let t = "Detected 2 speech segments:\nSpeech segment 0: start = 106.00, end = 185.00\nSpeech segment 1: start = 15511.00, end = 15597.00\n";
+        assert_eq!(parse_speech_regions(t), vec![(1.06, 1.85), (155.11, 155.97)]);
+    }
+
+    #[test]
+    fn words_stay_inside_their_speech() {
+        let w = |s: f64, e: f64, t: &str| Word { s, e, t: t.into(), sp: 0, b: false };
+        // The shape of clip 96: speech at 155.1, 159.8 and 170.2 s with silence between.
+        let regions = [(155.11, 155.97), (159.78, 160.13), (170.21, 171.58)];
+        let out = fit_to_speech(
+            vec![
+                w(155.5, 155.9, "up"),
+                w(159.9, 170.24, "so"),  // ran across 10 s of silence
+                w(170.0, 170.0, "Dude,"), // stacked a little before the speech
+                w(170.0, 170.0, "that"),
+                w(170.0, 170.5, "guy's"),
+                w(170.5, 171.0, "low"),
+            ],
+            &regions,
+        );
+        assert_eq!((out[0].s, out[0].e), (155.5, 155.9), "a word inside speech is left alone");
+        assert_eq!((out[1].s, out[1].e), (159.9, 160.13), "cut where the speech ends");
+        assert_eq!(out[2].s, 170.21, "never before the speech it belongs to");
+        assert!(out[2].e > out[2].s && out[3].s >= out[2].e && out[4].s >= out[3].e, "stacked words take turns: {out:?}");
+        assert!(out[4].e <= out[5].s && out[5].e == 171.0, "{out:?}");
+        for x in &out {
+            assert!(regions.iter().any(|r| x.s >= r.0 && x.e <= r.1), "{x:?} is in silence");
+        }
+    }
+
+    #[test]
+    fn muting_keeps_speech_and_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("c.wav"), dir.path().join("m.wav"));
+        let mut bytes = wav_header(RATE);
+        bytes.extend((0..RATE).flat_map(|_| 1000i16.to_le_bytes()));
+        std::fs::write(&src, &bytes).unwrap();
+        mute_outside(&src, &dst, &[(0.25, 0.5)]).unwrap();
+        let out = std::fs::read(&dst).unwrap();
+        assert_eq!(out.len(), bytes.len());
+        let at = |i: usize| i16::from_le_bytes([out[44 + 2 * i], out[45 + 2 * i]]);
+        assert_eq!((at(0), at(RATE / 4), at(RATE / 2 - 1), at(RATE / 2)), (0, 1000, 1000, 0));
     }
 
     #[test]

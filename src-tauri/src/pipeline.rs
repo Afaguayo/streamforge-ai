@@ -202,12 +202,13 @@ fn stream_censors(db: &Db, sid: i64) -> Result<Vec<(f64, f64)>> {
     Ok(censor::merge(r))
 }
 
-/// Transcripts from before chunked transcription are full of repeats and aren't censored.
+/// Transcripts from before chunked transcription are full of repeats and aren't censored;
+/// engine 2 ones have word times up to 14 s early (whisper's `--vad` timeline mapping).
 /// Queues them once at startup; heavy work still waits while you're live.
 pub fn redo_old_transcripts(db: &Db) -> Result<usize> {
     let ids: Vec<i64> = {
         let conn = db.conn();
-        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<2 AND s.file_path IS NOT NULL")?;
+        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<3 AND s.file_path IS NOT NULL")?;
         let rows = st.query_map([], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
@@ -293,8 +294,8 @@ async fn transcribe(ctx: &Ctx, job: &Job) -> Result<String> {
     let _ = std::fs::remove_dir_all(&pieces);
     let tuples: Vec<(f64, f64, &str)> = words.iter().map(|w| (w.s, w.e, w.t.as_str())).collect();
     db.conn().execute(
-        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,2)
-         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=2, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,3)
+         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=3, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
         rusqlite::params![sid, lang, serde_json::to_string(&tuples)?],
     )?;
     // Anything built from the old transcript is out of date.
