@@ -103,6 +103,7 @@ pub fn run() {
             commands::list_streams,
             commands::list_jobs,
             commands::recent_activity,
+            commands::list_activity,
             commands::retry_job,
             commands::cancel_job,
             commands::clear_failed_jobs,

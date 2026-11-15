@@ -2,11 +2,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { Download, ExternalLink, FolderOpen, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Badge, Button, Card, Field, Notice, Page, Toggle, inputCls } from "../components/ui";
+import { LayoutPicker } from "../components/LayoutPicker";
+import { Badge, Button, Card, Field, Notice, Page, Toggle, inputCls, useConfirm } from "../components/ui";
 import { api, errorText, type Settings, type Toolchain } from "../lib/api";
 import { usePoll } from "../lib/usePoll";
 
 function ClaudeKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string }) => void }) {
+  const confirm = useConfirm();
   const [value, setValue] = useState("");
   const { data: engine, refresh } = usePoll(api.engine, 10000);
   const save = async () => {
@@ -27,7 +29,7 @@ function ClaudeKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
       <div className="flex gap-2">
         <input type="password" className={inputCls} value={value} onChange={(e) => setValue(e.target.value)} placeholder={engine?.claude ? "••••••••••••" : "sk-ant-…"} />
         <Button variant="primary" disabled={!value.trim()} onClick={save}>Save</Button>
-        {engine?.claude && <Button variant="danger" onClick={async () => { await api.clearSecret("llm.api_key"); refresh(); }}>Remove</Button>}
+        {engine?.claude && <Button variant="danger" onClick={async () => { if (!(await confirm({ title: "Remove the Claude API key?", body: "Clips go back to being ranked by loudness and excitement words, without AI titles or hooks.", confirm: "Remove key" }))) return; await api.clearSecret("llm.api_key"); refresh(); }}>Remove</Button>}
         <Button onClick={() => openUrl("https://console.anthropic.com/settings/keys")}>Get a key <ExternalLink size={13} /></Button>
       </div>
     </Field>
@@ -35,6 +37,7 @@ function ClaudeKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
 }
 
 function GeminiKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string }) => void }) {
+  const confirm = useConfirm();
   const [value, setValue] = useState("");
   const [saved, setSaved] = useState<boolean | null>(null);
   useEffect(() => { api.secretStatus().then((s) => setSaved(!!s["gemini.api_key"])); }, []);
@@ -56,7 +59,7 @@ function GeminiKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
       <div className="flex gap-2">
         <input type="password" className={inputCls} value={value} onChange={(e) => setValue(e.target.value)} placeholder={saved ? "••••••••••••" : "AIza…"} />
         <Button variant="primary" disabled={!value.trim()} onClick={save}>Save</Button>
-        {saved && <Button variant="danger" onClick={async () => { await api.clearSecret("gemini.api_key"); setSaved(false); }}>Remove</Button>}
+        {saved && <Button variant="danger" onClick={async () => { if (!(await confirm({ title: "Remove the Gemini API key?", body: "New streams will get the standard thumbnail concepts instead of an AI thumbnail.", confirm: "Remove key" }))) return; await api.clearSecret("gemini.api_key"); setSaved(false); }}>Remove</Button>}
         <Button onClick={() => openUrl("https://aistudio.google.com/apikey")}>Get a key <ExternalLink size={13} /></Button>
       </div>
     </Field>
@@ -71,6 +74,8 @@ export default function SettingsPage() {
   const [dirty, setDirty] = useState(false);
   const { data: engine } = usePoll(api.engine, 3000);
   const { data: disks, refresh: refreshDisks } = usePoll(api.disks, 30000);
+  const { data: streams } = usePoll(api.streams, 30000);
+  const confirm = useConfirm();
 
   useEffect(() => {
     api.settings().then(setS);
@@ -134,25 +139,17 @@ export default function SettingsPage() {
             <Field label="Render the best clips automatically" hint="So they're ready to review when you wake up. 0 = render only when you approve.">
               <input type="number" min={0} max={20} className={`${inputCls} w-32`} value={s.auto_render_top} onChange={(e) => set({ auto_render_top: Number(e.target.value) })} />
             </Field>
-            <Field label="Clip layout">
-              <select className={`${inputCls} w-72`} value={s.clip_layout} onChange={(e) => set({ clip_layout: e.target.value as Settings["clip_layout"] })}>
-                <option value="blur">Gameplay centred on a blurred background</option>
-                <option value="facecam">Webcam on top, gameplay below</option>
-              </select>
-            </Field>
-            {s.clip_layout === "facecam" && (
-              <Field label="Where your webcam sits in the recording" hint="Percent of the frame: left, top, width, height. The default (0, 34, 29, 28) is the left edge, a third of the way down, where it sits in your OBS scene.">
-                <div className="flex gap-2">
-                  {(["Left", "Top", "Width", "Height"] as const).map((label, i) => (
-                    <label key={label} className="text-xs text-ink-500">
-                      {label}
-                      <input type="number" min={0} max={100} className={`${inputCls} mt-1 w-24`} value={Math.round(s.facecam_rect[i] * 100)}
-                        onChange={(e) => { const r = [...s.facecam_rect] as Settings["facecam_rect"]; r[i] = Math.min(1, Math.max(0, Number(e.target.value) / 100)); set({ facecam_rect: r }); }} />
-                    </label>
-                  ))}
-                </div>
-              </Field>
-            )}
+            <div>
+              <div className="text-sm font-medium">Clip layout</div>
+              <p className="mb-3 mt-0.5 text-[13px] text-ink-400">How each 9:16 clip is built. The small drawings show the finished clip. Applies to clips rendered after saving.</p>
+              <LayoutPicker
+                layout={s.clip_layout}
+                rect={s.facecam_rect}
+                onLayout={(clip_layout) => set({ clip_layout })}
+                onRect={(facecam_rect) => set({ facecam_rect })}
+                recording={streams?.find((x) => x.file_path && x.duration_s)?.file_path ?? null}
+              />
+            </div>
             <Toggle checked={s.subtitles} onChange={(v) => set({ subtitles: v })} label="Animated word-by-word captions" hint="Large, high-contrast and placed above where TikTok/Shorts put their buttons." />
           </div>
         </Card>
@@ -256,7 +253,10 @@ export default function SettingsPage() {
             <div className="flex items-center justify-between text-sm text-ink-300">
               <span>App data and database: <code className="text-ink-100">{dataDir}</code></span>
               <div className="flex gap-2">
-                <Button onClick={async () => { try { setMsg({ tone: "good", text: await api.cleanTemp() }); refreshDisks(); } catch (e) { setMsg({ tone: "bad", text: errorText(e) }); } }}><Trash2 size={14} /> Delete temp files</Button>
+                <Button onClick={async () => {
+                  if (!(await confirm({ title: "Delete temporary files?", body: "Removes leftover working files from processing. Your recordings, clips and thumbnails are not touched.", confirm: "Delete temp files" }))) return;
+                  try { setMsg({ tone: "good", text: await api.cleanTemp() }); refreshDisks(); } catch (e) { setMsg({ tone: "bad", text: errorText(e) }); }
+                }}><Trash2 size={14} /> Delete temp files</Button>
                 <Button onClick={() => openPath(dataDir)}>Open</Button>
               </div>
             </div>

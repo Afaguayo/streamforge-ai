@@ -74,6 +74,10 @@ pub struct Clip {
     error: Option<String>,
     posts: Vec<(String, String)>, // (platform, status)
     words: Vec<analysis::Word>,
+    /// Language the speech engine heard in the recording (the captions' language).
+    language: Option<String>,
+    /// Size of the rendered file in bytes, when it exists on disk.
+    render_size: Option<u64>,
 }
 
 #[tauri::command]
@@ -83,7 +87,8 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
         .prepare(
             "SELECT c.id,c.stream_id,s.title,c.start_s,c.end_s,c.score,c.scores,c.category,c.title,c.hook,c.reason,c.transcript,c.scored_by,
              c.status,c.render_status,c.render_path,c.cover_path,c.error,
-             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id), c.words
+             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id), c.words,
+             (SELECT language FROM transcripts WHERE stream_id=c.stream_id)
              FROM clips c JOIN streams s ON s.id=c.stream_id ORDER BY c.stream_id DESC, c.score DESC",
         )
         .map_err(q)?;
@@ -97,10 +102,16 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
                 render_status: r.get(14)?, render_path: r.get(15)?, cover_path: r.get(16)?, error: r.get(17)?,
                 posts: posts.unwrap_or_default().split(',').filter(|x| !x.is_empty()).filter_map(|x| x.split_once(':')).map(|(a, b)| (a.into(), b.into())).collect(),
                 words: r.get::<_, Option<String>>(19)?.and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default(),
+                language: r.get(20)?,
+                render_size: None,
             })
         })
         .map_err(q)?;
-    rows.collect::<Result<_, _>>().map_err(q)
+    let mut clips: Vec<Clip> = rows.collect::<Result<_, _>>().map_err(q)?;
+    for c in &mut clips {
+        c.render_size = c.render_path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    }
+    Ok(clips)
 }
 
 #[tauri::command]

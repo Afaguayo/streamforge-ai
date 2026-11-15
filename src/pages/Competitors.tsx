@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { Badge, Button, Card, Empty, Field, Notice, Page, inputCls } from "../components/ui";
+import { Badge, Button, Card, Empty, Field, Notice, Page, inputCls, useConfirm } from "../components/ui";
 import { api, errorText } from "../lib/api";
 import { ago, duration } from "../lib/format";
 import { usePoll } from "../lib/usePoll";
@@ -9,6 +9,7 @@ import { usePoll } from "../lib/usePoll";
 export default function Competitors() {
   const { data: list, refresh } = usePoll(api.watchlist, 6000);
   const [handle, setHandle] = useState("");
+  const confirm = useConfirm();
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
   const act = async (f: () => Promise<unknown>, ok: string) => {
     try {
@@ -39,7 +40,7 @@ export default function Competitors() {
       </Card>
       <div className="mt-5 space-y-4">
         {!list?.length ? (
-          <Empty>No creators yet.</Empty>
+          <Empty title="No creators yet">Add a YouTube @handle above to see how often they post, their average views and their breakout videos.</Empty>
         ) : (
           list.map((w) => {
             const s = w.summary;
@@ -57,7 +58,7 @@ export default function Competitors() {
                     </div>
                     {w.error && <div className="mt-1 text-sm text-red-300">{w.error}</div>}
                   </div>
-                  <Button variant="danger" onClick={() => act(() => api.removeWatch(w.id), "Removed.")}><Trash2 size={14} /></Button>
+                  <Button variant="danger" aria-label={`Stop watching ${w.title ?? w.handle}`} onClick={async () => { if (await confirm({ title: `Stop watching ${w.title ?? w.handle}?`, body: "Their saved stats are removed from this list. You can add them again later.", confirm: "Stop watching" })) act(() => api.removeWatch(w.id), "Removed."); }}><Trash2 size={14} /> Remove</Button>
                 </div>
                 {s.breakout && (
                   <div className="mt-3 rounded-lg border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-sm">

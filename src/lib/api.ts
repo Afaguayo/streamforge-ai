@@ -37,6 +37,8 @@ export type Job = {
   id: number;
   kind: string;
   stream_id: number | null;
+  /** JSON of what the job is for, e.g. {"clip":4} for a render. */
+  payload: string;
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress: number;
   message: string;
@@ -123,6 +125,10 @@ export type Clip = {
   error: string | null;
   posts: [string, string][];
   words: Word[];
+  /** Language the speech engine heard in the recording. */
+  language: string | null;
+  /** Size of the rendered file in bytes, if it exists. */
+  render_size: number | null;
 };
 
 export type Thumb = { id: number; stream_id: number; stream_title: string; path: string; rank: number; concept: string; selected: boolean };
@@ -228,6 +234,7 @@ export const api = {
   streams: () => invoke<Stream[]>("list_streams"),
   jobs: () => invoke<Job[]>("list_jobs"),
   activity: () => invoke<Activity[]>("recent_activity"),
+  activityLog: (limit: number) => invoke<Activity[]>("list_activity", { limit }),
   retryJob: (id: number) => invoke<boolean>("retry_job", { id }),
   cancelJob: (id: number) => invoke<boolean>("cancel_job", { id }),
   clearFailedJobs: () => invoke<number>("clear_failed_jobs"),
