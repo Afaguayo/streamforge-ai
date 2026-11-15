@@ -160,7 +160,15 @@ fn own_words(st: &AppState, id: i64) -> Res<Vec<analysis::Word>> {
 pub fn edit_clip_text(st: State<AppState>, id: i64, turns: Vec<String>) -> Res<()> {
     let words = analysis::retext(&own_words(&st, id)?, &turns).map_err(e)?;
     pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
+    drop_bleeped_copy(&st, id)?;
     posts::queue_render(&st.db, id).map_err(e)
+}
+
+/// Hand bleeps also go into the full stream, so a bleeped copy built before the edit is out of
+/// date and has to be made again.
+fn drop_bleeped_copy(st: &State<AppState>, clip: i64) -> Res<()> {
+    st.db.conn().execute("UPDATE streams SET censored_path=NULL WHERE id=(SELECT stream_id FROM clips WHERE id=?1)", [clip]).map_err(q)?;
+    Ok(())
 }
 
 /// Bleeps a word the censor missed, or un-bleeps one it got wrong. Applies on the next render.
@@ -169,7 +177,8 @@ pub fn toggle_bleep(st: State<AppState>, id: i64, index: usize) -> Res<()> {
     let mut words = own_words(&st, id)?;
     let w = words.get_mut(index).ok_or("that word no longer exists")?;
     w.b = !w.b;
-    pipeline::save_clip_words(&st.db, id, &words).map_err(e)
+    pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
+    drop_bleeped_copy(&st, id)
 }
 
 /// The recording's transcript as readable lines, for the Clip Picker.

@@ -597,25 +597,39 @@ fn turns(words: &[Word]) -> Vec<std::ops::Range<usize>> {
 
 /// Replaces each speaker turn's text. A turn with the same word count keeps its timings and
 /// bleeps; one that changed spreads its new words evenly across the turn's time.
+///
+/// Editing captions never un-bleeps the audio: a bleeped word keeps its own timing even in a
+/// changed turn (spread out, the bleep would land on the wrong word), and stays bleeped if its
+/// marker is deleted, since the word is still in the audio. The slur typed into a caption is
+/// masked and bleeped like a heard one.
 pub fn retext(words: &[Word], texts: &[String]) -> Result<Vec<Word>> {
     let spans = turns(words);
     if spans.len() != texts.len() {
         return Err(anyhow!("the clip changed; reopen the editor and try again"));
     }
+    let typed = |w: Word| if crate::censor::is_slur(&w.t, &[]) { Word { t: crate::censor::mask(&w.t), b: true, ..w } } else { w };
     let mut out = Vec::with_capacity(words.len());
     for (span, text) in spans.into_iter().zip(texts) {
         let old = &words[span];
         let new: Vec<&str> = text.split_whitespace().collect();
         if new.len() == old.len() {
             // A bleeped word comes back as its marker: it keeps its original word and bleep.
-            out.extend(old.iter().zip(&new).map(|(w, t)| if *t == BLEEP_MARK && w.b { w.clone() } else { Word { t: t.to_string(), ..w.clone() } }));
+            out.extend(old.iter().zip(&new).map(|(w, t)| if *t == BLEEP_MARK && w.b { w.clone() } else { typed(Word { t: t.to_string(), ..w.clone() }) }));
         } else {
             let (a, b) = (old[0].s, old[old.len() - 1].e);
             let step = (b - a) / new.len().max(1) as f64;
-            out.extend(new.iter().enumerate().map(|(i, t)| {
-                let b = *t == BLEEP_MARK || t.contains('*');
-                Word { s: a + i as f64 * step, e: a + (i + 1) as f64 * step, t: t.to_string(), sp: old[0].sp, b }
-            }));
+            let mut bleeped = old.iter().filter(|w| w.b);
+            let mut turn: Vec<Word> = new
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match (*t == BLEEP_MARK).then(|| bleeped.next()).flatten() {
+                    Some(w) => w.clone(),
+                    None => typed(Word { s: a + i as f64 * step, e: a + (i + 1) as f64 * step, t: t.to_string(), sp: old[0].sp, b: *t == BLEEP_MARK || t.contains('*') }),
+                })
+                .collect();
+            turn.extend(bleeped.cloned());
+            turn.sort_by(|x, y| x.s.partial_cmp(&y.s).unwrap());
+            out.extend(turn);
         }
     }
     Ok(out)
@@ -787,6 +801,32 @@ mod tests {
         assert!(out[1].b && out[1].t == "n****", "same word count keeps the original");
         let out = retext(&w, &["my [bleep] went home now".into()]).unwrap();
         assert!(out[1].b, "a respread turn still bleeps the marker");
+    }
+
+    #[test]
+    fn caption_edits_never_move_or_drop_a_bleep() {
+        let mut w = sentence(10.0, "yo my n**** went home");
+        w[2].b = true;
+        let (s, e) = (w[2].s, w[2].e);
+        // A changed turn: the bleep keeps the word's own timing instead of being spread out.
+        let out = retext(&w, &["hey [bleep] went".into()]).unwrap();
+        let b: Vec<&Word> = out.iter().filter(|x| x.b).collect();
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].s, b[0].e), (s, e));
+        assert_eq!(words_text(&out), "hey went");
+        // The marker deleted: the word is still in the audio, so it stays bleeped and hidden.
+        let out = retext(&w, &["yo my went home".into()]).unwrap();
+        assert!(out.iter().any(|x| x.b && x.s == s && x.e == e));
+        assert_eq!(words_text(&out), "yo my went home");
+    }
+
+    #[test]
+    fn the_slur_typed_into_a_caption_is_masked_and_bleeped() {
+        let w = sentence(0.0, "my friend went home");
+        let out = retext(&w, &["my nigga went home".into()]).unwrap();
+        assert!(out[1].b && out[1].t == "n****" && out[1].s == w[1].s);
+        let out = retext(&w, &["my Niggas went home now".into()]).unwrap();
+        assert!(out[1].b && !words_text(&out).to_lowercase().contains("nig"));
     }
 
     #[test]

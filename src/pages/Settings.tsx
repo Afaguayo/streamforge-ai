@@ -141,7 +141,7 @@ export default function SettingsPage() {
               </select>
             </Field>
             {s.clip_layout === "facecam" && (
-              <Field label="Where your webcam sits in the recording" hint="Percent of the frame: left, top, width, height. The default is the top-right corner.">
+              <Field label="Where your webcam sits in the recording" hint="Percent of the frame: left, top, width, height. The default (0, 34, 29, 28) is the left edge, a third of the way down, where it sits in your OBS scene.">
                 <div className="flex gap-2">
                   {(["Left", "Top", "Width", "Height"] as const).map((label, i) => (
                     <label key={label} className="text-xs text-ink-500">
