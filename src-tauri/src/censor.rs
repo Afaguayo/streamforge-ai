@@ -13,14 +13,24 @@ const STEM: &str = "nigg";
 const VARIANTS: &[&str] = &["niga", "nigas", "nigah", "nigaz", "nigguh", "nibba", "nibbas", "n-word", "nword"];
 /// Ordinary Spanish ("black"), so only censored where the speech is English: there the speech
 /// engine sometimes writes the slur this way. Seen on a real stream: "gash what, Negro?".
-const ENGLISH_ONLY: &[&str] = &["negro", "negros", "negroes"];
+/// "Nega" and "Nego" are the same mishearing, seen in English speech on real streams:
+/// "watch out Nego." and "Nega just got parried!".
+const ENGLISH_ONLY: &[&str] = &["negro", "negros", "negroes", "nega", "negas", "nego"];
+/// Full spellings the speech engine's own starred forms are checked against (`n***a`).
+const STARRED: &[&str] = &["nigga", "niggas", "niggaz", "niggah", "nigger", "niggers"];
 /// Unrelated words that share the prefix.
 const NOT_SLURS: &[&str] = &["niggle", "niggles", "niggled", "niggling", "niggly", "niggard", "niggardly"];
 
-/// Seconds added around a word, so its edges are covered.
-const PAD: f64 = 0.10;
-/// Word timings are approximate; a bleep shorter than this can miss the word.
-const MIN_LEN: f64 = 0.45;
+/// Seconds added around a word, so its edges are covered. Word timings are often off by a
+/// couple of tenths, and missing the word costs far more than muting a bit of the next one.
+const PAD: f64 = 0.20;
+/// A quarter of the engine's words come back with no length at all (stored as 0.12 s), so
+/// the real word can sit on either side of its timing; a bleep shorter than this can miss it.
+const MIN_LEN: f64 = 0.70;
+/// Seconds added on each side of a word only the second listen heard. That listen skips voice
+/// detection and its timings are worse: on a real stream it put the word 0.8 s before the
+/// first listen's mishearing of the same word.
+const SECOND_PASS_SLACK: f64 = 0.30;
 /// Some words come back with timings seconds long. A bleep never runs past this, so one bad
 /// timing can't silence a whole stretch of speech.
 const MAX_LEN: f64 = 1.5;
@@ -30,12 +40,36 @@ fn norm(word: &str) -> String {
 }
 
 pub fn is_slur(word: &str, extra: &[String]) -> bool {
+    if starred_slur(word) {
+        return true;
+    }
     // Trailing punctuation goes first, so "niggas!" doesn't turn into "niggasi".
     let w = norm(word.trim_end_matches(|c: char| !c.is_alphanumeric()));
     if w.is_empty() || NOT_SLURS.contains(&w.as_str()) {
         return false;
     }
     w.starts_with(STEM) || VARIANTS.contains(&w.as_str()) || extra.iter().any(|x| norm(x) == w)
+}
+
+/// The speech engine sometimes stars the word itself (`n***a,`). Each run of stars stands for
+/// one or more letters; the visible letters must fit one of the full spellings.
+fn starred_slur(word: &str) -> bool {
+    let w: String = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '*').to_lowercase();
+    if !w.contains('*') || !w.starts_with('n') || !w.chars().all(|c| c.is_alphanumeric() || c == '*') {
+        return false;
+    }
+    fn fits(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => {
+                let rest = &p[p.iter().position(|c| *c != '*').unwrap_or(p.len())..];
+                (1..=t.len()).any(|n| fits(rest, &t[n..]))
+            }
+            Some(c) => t.first() == Some(c) && fits(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = w.chars().collect();
+    STARRED.iter().any(|s| fits(&p, &s.chars().collect::<Vec<_>>()))
 }
 
 fn english_slur(word: &str) -> bool {
@@ -51,20 +85,23 @@ fn hit(w: &Word, extra: &[String], english: &[(f64, f64)]) -> bool {
     is_slur(&w.t, extra) || (english_slur(&w.t) && inside(english, w.s))
 }
 
-/// Whether `word` is one this censor masked: a letter, then only stars (`n****`). Words the
-/// speech engine starred itself (`sh*t`) and sound tags (`*laughs*`) don't count.
+/// Whether `word` is one this censor masked: a letter, then only stars (`n****`), or the
+/// speech engine's own starred spelling of the slur (`n***a`), which transcripts made before
+/// the censor knew that form still hold. Other words the engine starred (`sh*t`) and sound
+/// tags (`*laughs*`) don't count.
 pub fn is_masked(word: &str) -> bool {
     let w = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '*');
     let mut chars = w.chars();
-    chars.next().is_some_and(|c| c.is_alphanumeric()) && w.len() > 1 && chars.all(|c| c == '*')
+    (chars.next().is_some_and(|c| c.is_alphanumeric()) && w.len() > 1 && chars.all(|c| c == '*')) || starred_slur(word)
 }
 
 /// First letter plus stars, keeping any punctuation out: `n****`.
 pub fn mask(word: &str) -> String {
-    if word.contains('*') {
+    if word.contains('*') && !starred_slur(word) {
         return word.to_string(); // already masked
     }
-    let letters: Vec<char> = word.chars().filter(|c| c.is_alphanumeric()).collect();
+    // Stars count as letters, so the engine's own `n***a` becomes `n****` like any other.
+    let letters: Vec<char> = word.chars().filter(|c| c.is_alphanumeric() || *c == '*').collect();
     let first = letters.first().copied().unwrap_or('*');
     format!("{first}{}", "*".repeat(letters.len().saturating_sub(1).max(1)))
 }
@@ -83,13 +120,17 @@ pub fn apply(words: &mut [Word], extra: &[String], english: &[(f64, f64)]) -> Ve
 
 /// Adds what a second listen caught and the first didn't. No single pass hears everything: on
 /// a real stream, each pass found the word in places the other missed. Returns how many.
+///
+/// A hit is skipped only when the middle of it is already bleeped. The word is often said
+/// twice within a second or two, so being near a bleep isn't enough.
 pub fn add_missed(words: &mut Vec<Word>, second_pass: &[Word], extra: &[String], english: &[(f64, f64)]) -> usize {
-    const SAME_SPOT: f64 = 2.0;
     let mut added = 0;
     for hit in second_pass.iter().filter(|w| hit(w, extra, english)) {
-        if !words.iter().any(|w| w.b && (w.s - hit.s).abs() <= SAME_SPOT) {
-            let at = words.partition_point(|w| w.s < hit.s);
-            words.insert(at, Word { s: hit.s, e: hit.e, t: mask(&hit.t), sp: 0, b: true });
+        let mid = (hit.s + hit.e) / 2.0;
+        let (s, e) = ((hit.s - SECOND_PASS_SLACK).max(0.0), hit.e + SECOND_PASS_SLACK);
+        if !words.iter().filter(|w| w.b).map(|w| range(w.s, w.e)).any(|(a, b)| a <= mid && mid <= b) {
+            let at = words.partition_point(|w| w.s < s);
+            words.insert(at, Word { s, e, t: mask(&hit.t), sp: 0, b: true });
             added += 1;
         }
     }
@@ -104,6 +145,24 @@ pub fn range(s: f64, e: f64) -> (f64, f64) {
     }
     let grow = (MIN_LEN - (b - a)) / 2.0;
     ((a - grow).max(0.0), b + grow)
+}
+
+/// Moves bleeps from recording time onto the timeline of an upload made of only the `parts`
+/// kept (dead air cut). A bleep that starts or ends inside a cut keeps the piece that is in a
+/// kept part, and one that spans a cut is bleeped on both sides of the seam.
+pub fn onto_parts(ranges: &[(f64, f64)], parts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let mut before = 0.0;
+    for (pa, pb) in parts {
+        for (a, b) in ranges {
+            let (s, e) = (a.max(*pa), b.min(*pb));
+            if s < e {
+                out.push((before + s - pa, before + e - pa));
+            }
+        }
+        before += pb - pa;
+    }
+    merge(out)
 }
 
 /// Sorts ranges and joins the ones that touch.
@@ -180,11 +239,11 @@ mod tests {
     fn second_pass_only_adds_new_spots() {
         let mut words = vec![w(10.0, 10.3, "hello"), w(20.0, 20.3, "nigga"), w(30.0, 30.3, "bye")];
         apply(&mut words, &[], &[]);
-        let second = vec![w(20.5, 20.8, "niggas"), w(25.0, 25.3, "nigga"), w(26.0, 26.3, "fine")];
+        let second = vec![w(20.1, 20.4, "niggas"), w(25.0, 25.3, "nigga"), w(26.0, 26.3, "fine")];
         assert_eq!(add_missed(&mut words, &second, &[], &[]), 1);
         let shown: Vec<&str> = words.iter().map(|x| x.t.as_str()).collect();
         assert_eq!(shown, ["hello", "n****", "n****", "bye"]);
-        assert!(words[2].b && words[2].s == 25.0);
+        assert!(words[2].b && words[2].s < 25.0 && words[2].e > 25.3);
     }
 
     #[test]
@@ -229,6 +288,62 @@ mod tests {
     #[test]
     fn close_ranges_merge() {
         assert_eq!(merge(vec![(5.0, 6.0), (1.0, 2.0), (1.5, 3.0)]), vec![(1.0, 3.0), (5.0, 6.0)]);
+    }
+
+    #[test]
+    fn engines_own_starred_spelling_is_caught_and_bleeped() {
+        // Seen on a real stream: "Yo, it was n***a, I f***ing ran".
+        for t in ["n***a,", "N***A", "n*gga", "ni**as.", "\"n***a"] {
+            assert!(is_slur(t, &[]), "{t}");
+            assert!(is_masked(t), "stored transcripts with this form load as bleeped: {t}");
+        }
+        for t in ["f***ing", "sh*t", "coj***?", "*laughs*", "nice"] {
+            assert!(!is_slur(t, &[]), "{t}");
+        }
+        let mut words = vec![w(1.0, 1.4, "was"), w(1.4, 2.1, "n***a,"), w(2.1, 2.3, "I")];
+        assert_eq!(apply(&mut words, &[], &[]).len(), 1);
+        assert_eq!(words[1].t, "n****");
+        assert!(words[1].b && is_masked(&words[1].t));
+    }
+
+    #[test]
+    fn nega_and_nego_mishearings_only_in_english() {
+        let mut words = vec![w(5.0, 5.3, "Nega"), w(6.0, 6.3, "Nego."), w(300.0, 300.3, "nega")];
+        assert_eq!(apply(&mut words, &[], &[(0.0, 180.0)]).len(), 2);
+        assert!(words[0].b && words[1].b && !words[2].b, "Spanish speech keeps the word");
+    }
+
+    #[test]
+    fn bleeps_reach_past_loose_word_timings() {
+        // A word the engine gave no length (stored as 0.12 s) can be off by 0.3 s either way.
+        let (a, b) = range(10.0, 10.12);
+        assert!(a <= 9.75 && b >= 10.4, "{a}..{b}");
+        let (a, b) = range(10.0, 10.5);
+        assert!(a <= 9.8 && b >= 10.7, "{a}..{b}");
+    }
+
+    #[test]
+    fn second_pass_adds_a_repeat_close_to_a_caught_word() {
+        // The word said twice, 0.8 s apart; the first listen caught only the first.
+        let mut words = vec![w(10.0, 10.12, "nigga"), w(10.8, 10.92, "what")];
+        apply(&mut words, &[], &[]);
+        let second = vec![w(10.05, 10.17, "nigga"), w(10.8, 10.92, "nigga")];
+        assert_eq!(add_missed(&mut words, &second, &[], &[]), 1, "the same spot is not added twice");
+        let r = merge(words.iter().filter(|x| x.b).map(|x| range(x.s, x.e)).collect());
+        assert!(r.iter().any(|(a, b)| *a <= 10.3 && *b >= 11.4), "second-pass timing is widened: {r:?}");
+    }
+
+    #[test]
+    fn bleeps_follow_dead_air_cuts() {
+        let parts = [(0.0, 100.0), (200.0, 300.0)];
+        // Inside a kept part: shifted by the 100 s cut before it.
+        assert_eq!(onto_parts(&[(250.0, 251.0)], &parts), vec![(150.0, 151.0)]);
+        // Starts inside the cut: the kept piece is still bleeped, not dropped.
+        assert_eq!(onto_parts(&[(199.6, 200.5)], &parts), vec![(100.0, 100.5)]);
+        // Runs across the cut: bleeped on both sides of the seam.
+        assert_eq!(onto_parts(&[(99.5, 200.5)], &parts), vec![(99.5, 100.5)]);
+        // Wholly inside the cut: nothing is left to hear.
+        assert!(onto_parts(&[(150.0, 151.0)], &parts).is_empty());
     }
 
     #[test]

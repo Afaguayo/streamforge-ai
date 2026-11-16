@@ -74,6 +74,10 @@ pub struct Clip {
     error: Option<String>,
     posts: Vec<(String, String)>, // (platform, status)
     words: Vec<analysis::Word>,
+    /// Language the speech engine heard in the recording (the captions' language).
+    language: Option<String>,
+    /// Size of the rendered file in bytes, when it exists on disk.
+    render_size: Option<u64>,
 }
 
 #[tauri::command]
@@ -83,7 +87,8 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
         .prepare(
             "SELECT c.id,c.stream_id,s.title,c.start_s,c.end_s,c.score,c.scores,c.category,c.title,c.hook,c.reason,c.transcript,c.scored_by,
              c.status,c.render_status,c.render_path,c.cover_path,c.error,
-             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id), c.words
+             (SELECT GROUP_CONCAT(platform || ':' || status) FROM posts WHERE clip_id=c.id), c.words,
+             (SELECT language FROM transcripts WHERE stream_id=c.stream_id)
              FROM clips c JOIN streams s ON s.id=c.stream_id ORDER BY c.stream_id DESC, c.score DESC",
         )
         .map_err(q)?;
@@ -97,10 +102,16 @@ pub fn list_clips(st: State<AppState>) -> Res<Vec<Clip>> {
                 render_status: r.get(14)?, render_path: r.get(15)?, cover_path: r.get(16)?, error: r.get(17)?,
                 posts: posts.unwrap_or_default().split(',').filter(|x| !x.is_empty()).filter_map(|x| x.split_once(':')).map(|(a, b)| (a.into(), b.into())).collect(),
                 words: r.get::<_, Option<String>>(19)?.and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default(),
+                language: r.get(20)?,
+                render_size: None,
             })
         })
         .map_err(q)?;
-    rows.collect::<Result<_, _>>().map_err(q)
+    let mut clips: Vec<Clip> = rows.collect::<Result<_, _>>().map_err(q)?;
+    for c in &mut clips {
+        c.render_size = c.render_path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    }
+    Ok(clips)
 }
 
 #[tauri::command]
@@ -158,9 +169,17 @@ fn own_words(st: &AppState, id: i64) -> Res<Vec<analysis::Word>> {
 /// Replaces the captions, one text per speaker turn, and re-renders.
 #[tauri::command]
 pub fn edit_clip_text(st: State<AppState>, id: i64, turns: Vec<String>) -> Res<()> {
-    let words = analysis::retext(&own_words(&st, id)?, &turns).map_err(e)?;
+    let words = analysis::retext(&own_words(&st, id)?, &turns, &crate::settings::Settings::load(&st.db).censor_words).map_err(e)?;
     pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
+    drop_bleeped_copy(&st, id)?;
     posts::queue_render(&st.db, id).map_err(e)
+}
+
+/// Hand bleeps also go into the full stream, so a bleeped copy built before the edit is out of
+/// date and has to be made again.
+fn drop_bleeped_copy(st: &State<AppState>, clip: i64) -> Res<()> {
+    st.db.conn().execute("UPDATE streams SET censored_path=NULL WHERE id=(SELECT stream_id FROM clips WHERE id=?1)", [clip]).map_err(q)?;
+    Ok(())
 }
 
 /// Bleeps a word the censor missed, or un-bleeps one it got wrong. Applies on the next render.
@@ -169,7 +188,8 @@ pub fn toggle_bleep(st: State<AppState>, id: i64, index: usize) -> Res<()> {
     let mut words = own_words(&st, id)?;
     let w = words.get_mut(index).ok_or("that word no longer exists")?;
     w.b = !w.b;
-    pipeline::save_clip_words(&st.db, id, &words).map_err(e)
+    pipeline::save_clip_words(&st.db, id, &words).map_err(e)?;
+    drop_bleeped_copy(&st, id)
 }
 
 /// The recording's transcript as readable lines, for the Clip Picker.
@@ -206,6 +226,31 @@ pub fn create_manual_clip(db: &crate::db::Db, stream_id: i64, start: f64, end: f
     };
     posts::queue_render(db, id)?;
     Ok(id)
+}
+
+#[derive(Serialize)]
+pub struct Cuts {
+    /// Found automatically: stretches with no talking and little going on.
+    auto: Vec<(f64, f64)>,
+    /// Marked by you in the Clip Picker.
+    manual: Vec<(f64, f64)>,
+}
+
+#[tauri::command]
+pub fn stream_cuts(st: State<AppState>, id: i64) -> Res<Cuts> {
+    let auto: Option<String> = st.db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [id], |r| r.get(0)).map_err(q)?;
+    Ok(Cuts { auto: auto.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(), manual: pipeline::manual_cuts(&st.db, id) })
+}
+
+/// Adds or removes a stretch you want cut from the full upload.
+#[tauri::command]
+pub fn set_manual_cuts(st: State<AppState>, id: i64, cuts: Vec<(f64, f64)>) -> Res<()> {
+    if cuts.iter().any(|(a, b)| b <= a || *a < 0.0) {
+        return Err("each cut needs an end after its start".into());
+    }
+    let merged = crate::censor::merge(cuts);
+    st.db.conn().execute("UPDATE streams SET manual_cuts=?2, censored_path=NULL WHERE id=?1", rusqlite::params![id, serde_json::to_string(&merged).map_err(|err| err.to_string())?]).map_err(q)?;
+    Ok(())
 }
 
 /// Copies a finished clip to where you chose.

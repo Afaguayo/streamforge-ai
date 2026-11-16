@@ -3,7 +3,7 @@ import { CheckCircle2, ChevronDown, Copy, ExternalLink, KeyRound, LogIn, LogOut,
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, errorText, type Platform } from "../lib/api";
 import { ago } from "../lib/format";
-import { Badge, Button, Card, Field, Notice, inputCls } from "./ui";
+import { Badge, Button, Card, Field, Notice, inputCls, useConfirm } from "./ui";
 
 type Msg = { tone: "good" | "bad" | "info" | "warn"; text: string } | null;
 
@@ -120,6 +120,7 @@ function AccountDetails({ p }: { p: Platform }) {
 
 /** Sign-in card for one platform: status, sign-in/out, and the one-time developer-app setup. */
 export function PlatformCard({ p, onChanged }: { p: Platform; onChanged: () => void }) {
+  const confirm = useConfirm();
   const g = GUIDE[p.id];
   const [setupOpen, setSetupOpen] = useState(!p.keys_set && !p.account);
   const [secretStatus, setSecretStatus] = useState<Record<string, boolean>>({});
@@ -193,7 +194,7 @@ export function PlatformCard({ p, onChanged }: { p: Platform; onChanged: () => v
           <div className="flex shrink-0 gap-2">
             <Button onClick={() => act(() => api.checkAccount(p.id), (n) => `Still linked as ${n}.`)}><RefreshCw size={14} /> Check</Button>
             <Button onClick={signIn} disabled={waiting}><LogIn size={14} /> Sign in again</Button>
-            <Button variant="danger" onClick={() => act(() => api.disconnect(p.id), () => `${p.name} disconnected.`)}><LogOut size={14} /> Disconnect</Button>
+            <Button variant="danger" onClick={async () => { if (await confirm({ title: `Disconnect ${p.name}?`, body: "StreamForge stops posting there until you sign in again. Posts already published stay up.", confirm: "Disconnect" })) act(() => api.disconnect(p.id), () => `${p.name} disconnected.`); }}><LogOut size={14} /> Disconnect</Button>
           </div>
         </div>
       ) : waiting ? (

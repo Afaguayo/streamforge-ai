@@ -1,22 +1,33 @@
 import { Activity, AlertTriangle, CheckCircle2, PauseCircle } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { PageId } from "../App";
 import { api, type Job, type Stream } from "../lib/api";
 import { remaining } from "../lib/format";
 import { usePoll } from "../lib/usePoll";
-import { JOB_LABEL } from "./StreamBits";
+import { JOB_LABEL } from "../lib/stages";
+import { ProgressBar } from "./ui";
+
+export { ProgressBar };
 
 export type Progress = {
   jobs: Job[];
   current: Job | null;
   waiting: Job[];
+  /// Failed once and scheduled to try again later.
+  retrying: Job[];
   failed: Job[];
   /// Held back: a queued job's message says why (live, low disk).
   paused: Job | null;
   secondsLeft: number | null;
   streamTitle: (j: Job) => string | null;
+  /// Seconds left for a job. Only the running one can be estimated.
+  eta: (j: Job) => number | null;
   refresh: () => void;
 };
+
+export const ProgressContext = createContext<Progress | null>(null);
+/// The shared job queue state (provided by `App`); null outside the app.
+export const useJobs = () => useContext(ProgressContext);
 
 /// Live state of the job queue. Runs once, in `App`, so the time estimate carries across pages.
 export function useProgress(): Progress {
@@ -44,20 +55,14 @@ export function useProgress(): Progress {
     jobs: all,
     current,
     waiting: queued.filter(due).reverse(),
+    retrying: queued.filter((j) => !due(j)),
     failed: all.filter((j) => j.status === "failed"),
     paused: current ? null : queued.find((j) => /^(Paused|Waiting:)/.test(j.message)) ?? null,
     secondsLeft: current && seen.current ? remaining(current.progress, seen.current.p, seen.current.t, now) : null,
     streamTitle: (j) => (j.stream_id != null ? names.get(j.stream_id) ?? null : null),
+    eta: (j) => (current && j.id === current.id && seen.current ? remaining(current.progress, seen.current.p, seen.current.t, now) : null),
     refresh,
   };
-}
-
-export function ProgressBar({ value }: { value: number }) {
-  return (
-    <div className="h-1.5 overflow-hidden rounded bg-ink-800">
-      <div className="h-full rounded bg-sky-400 transition-all duration-700" style={{ width: `${Math.round(value * 100)}%` }} />
-    </div>
-  );
 }
 
 export function timeLeft(s: number | null) {
@@ -71,7 +76,7 @@ export function timeLeft(s: number | null) {
 export function ProgressDock({ p, go }: { p: Progress; go: (page: PageId) => void }) {
   const { current, waiting, failed, paused } = p;
   return (
-    <button onClick={() => go("progress")} className="block w-full border-t border-ink-800 px-4 py-3 text-left hover:bg-ink-850">
+    <button onClick={() => go("progress")} className="block w-full bg-ink-850 px-4 py-3 text-left hover:bg-ink-800">
       {current ? (
         <>
           <div className="flex items-center justify-between gap-2 text-xs">
@@ -82,7 +87,7 @@ export function ProgressDock({ p, go }: { p: Progress; go: (page: PageId) => voi
             <span className="tabular-nums text-ink-300">{Math.round(current.progress * 100)}%</span>
           </div>
           <div className="mt-1.5"><ProgressBar value={current.progress} /></div>
-          <div className="mt-1.5 truncate text-[11px] text-ink-500">
+          <div className="mt-1.5 truncate text-xs text-ink-400">
             {timeLeft(p.secondsLeft)}{waiting.length > 0 && ` · ${waiting.length} more waiting`}
           </div>
         </>
@@ -91,7 +96,7 @@ export function ProgressDock({ p, go }: { p: Progress; go: (page: PageId) => voi
       ) : (
         <div className="flex items-center gap-1.5 text-xs text-ink-500"><CheckCircle2 size={13} /> Nothing running</div>
       )}
-      {failed.length > 0 && <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-red-300"><AlertTriangle size={12} /> {failed.length} failed</div>}
+      {failed.length > 0 && <div className="mt-1.5 flex items-center gap-1.5 text-xs text-red-300"><AlertTriangle size={12} /> {failed.length} failed</div>}
     </button>
   );
 }

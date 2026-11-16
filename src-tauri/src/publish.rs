@@ -134,6 +134,47 @@ pub async fn youtube_thumbnail(video_id: &str, thumb: &Path) -> Result<()> {
     Ok(())
 }
 
+const CAPTION_NAME: &str = "Transcript";
+
+/// Uploads a subtitle track, replacing the one this app added before.
+pub async fn youtube_captions(video_id: &str, language: &str, srt: &str) -> Result<()> {
+    let token = oauth::access_token(oauth::provider("youtube")?).await?;
+    let list: Value = http()
+        .get("https://www.googleapis.com/youtube/v3/captions")
+        .query(&[("part", "snippet"), ("videoId", video_id)])
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if let Some(msg) = list["error"]["message"].as_str() {
+        bail!("YouTube refused the subtitle list: {msg}");
+    }
+    for c in list["items"].as_array().into_iter().flatten() {
+        if c["snippet"]["name"].as_str() == Some(CAPTION_NAME) {
+            if let Some(id) = c["id"].as_str() {
+                let _ = http().delete("https://www.googleapis.com/youtube/v3/captions").query(&[("id", id)]).bearer_auth(&token).send().await?;
+            }
+        }
+    }
+    let meta = json!({ "snippet": { "videoId": video_id, "language": language, "name": CAPTION_NAME, "isDraft": false } });
+    let boundary = "streamforge-caption-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n{srt}\r\n--{boundary}--\r\n"
+    );
+    let resp = http()
+        .post("https://www.googleapis.com/upload/youtube/v3/captions?uploadType=multipart&part=snippet")
+        .bearer_auth(&token)
+        .header("Content-Type", format!("multipart/related; boundary={boundary}"))
+        .body(body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("YouTube refused the subtitles: {}", err_text(resp).await);
+    }
+    Ok(())
+}
+
 /// Title, description, tags and privacy of a video already on YouTube.
 pub struct VideoInfo {
     pub title: String,

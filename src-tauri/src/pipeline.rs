@@ -115,6 +115,7 @@ async fn run(ctx: &Ctx, job: &Job) -> Result<String> {
         "render" => render_clip(ctx, job).await,
         "thumbnails" => thumbnails(ctx, job).await,
         "publish" => publish_post(ctx, job).await,
+        "upload_captions" => upload_captions(ctx, job).await,
         "update_video" => {
             let p = posts::get_post(db, payload_id(job, "post")?)?;
             let id = p.remote_id.ok_or_else(|| anyhow!("this post has no YouTube video"))?;
@@ -201,13 +202,18 @@ fn stream_censors(db: &Db, sid: i64) -> Result<Vec<(f64, f64)>> {
     Ok(censor::merge(r))
 }
 
-/// Transcripts from before chunked transcription are full of repeats and aren't censored.
+/// Transcripts from before chunked transcription are full of repeats and aren't censored;
+/// engine 2 ones have word times up to 14 s early (whisper's `--vad` timeline mapping).
 /// Queues them once at startup; heavy work still waits while you're live.
-pub fn redo_old_transcripts(db: &Db) -> Result<usize> {
+///
+/// Engine 2 ones are only redone when the voice detection tool is installed: without it the
+/// new transcript would have the same early times, and be redone again on every start.
+pub fn redo_old_transcripts(db: &Db, data_dir: &Path) -> Result<usize> {
+    let below = if analysis::speech_detector(&tools::whisper_exe(data_dir)).is_file() { 3 } else { 2 };
     let ids: Vec<i64> = {
         let conn = db.conn();
-        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<2 AND s.file_path IS NOT NULL")?;
-        let rows = st.query_map([], |r| r.get(0))?;
+        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<?1 AND s.file_path IS NOT NULL")?;
+        let rows = st.query_map([below], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
     for id in &ids {
@@ -292,9 +298,10 @@ async fn transcribe(ctx: &Ctx, job: &Job) -> Result<String> {
     let _ = std::fs::remove_dir_all(&pieces);
     let tuples: Vec<(f64, f64, &str)> = words.iter().map(|w| (w.s, w.e, w.t.as_str())).collect();
     db.conn().execute(
-        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,2)
-         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=2, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-        rusqlite::params![sid, lang, serde_json::to_string(&tuples)?],
+        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=excluded.engine, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        // Engine 3 means the times were made with the voice detection tool; without it they are engine 2's.
+        rusqlite::params![sid, lang, serde_json::to_string(&tuples)?, if analysis::speech_detector(&exe).is_file() { 3 } else { 2 }],
     )?;
     // Anything built from the old transcript is out of date.
     db.conn().execute("UPDATE streams SET censored_path=NULL, meta=NULL WHERE id=?1", [sid])?;
@@ -305,7 +312,8 @@ async fn transcribe(ctx: &Ctx, job: &Job) -> Result<String> {
         rows.collect::<Result<_, _>>()?
     };
     for (id, start, end) in approved {
-        save_clip_words(db, id, &analysis::slice_words(&words, start, end))?;
+        let old: Vec<analysis::Word> = db.conn().query_row("SELECT words FROM clips WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten().and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default();
+        save_clip_words(db, id, &analysis::keep_bleeps(analysis::slice_words(&words, start, end), &old))?;
         posts::queue_render(db, id)?;
     }
     set_stream_status(db, sid, "transcribed")?;
@@ -352,8 +360,18 @@ async fn analyze(ctx: &Ctx, job: &Job) -> Result<String> {
     let kept = {
         let conn = db.conn();
         conn.execute("DELETE FROM clips WHERE stream_id=?1 AND status='suggested'", [sid])?;
+        // On a second pass over a stream, a moment that is already a clip (approved, posted or
+        // rejected) is not suggested again: it would be rendered and could be posted twice.
+        let taken: Vec<(f64, f64)> = {
+            let mut st = conn.prepare("SELECT start_s,end_s FROM clips WHERE stream_id=?1")?;
+            let rows = st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
         let mut kept = 0;
         for (i, c) in cands.iter_mut().enumerate() {
+            if taken.iter().any(|(a, b)| c.end.min(*b) - c.start.max(*a) > (c.end - c.start) / 2.0) {
+                continue;
+            }
             let (mut sc, mut cat, mut ttl, mut hook, mut reason, mut status, mut by) =
                 (c.scores.clone(), c.category.clone(), c.title.clone(), String::new(), String::new(), "suggested", "heuristic");
             if let Some(l) = llm_scores.as_ref().and_then(|v| v.get(i)) {
@@ -591,6 +609,48 @@ async fn download_vod(ctx: &Ctx, job: &Job) -> Result<String> {
 
 // ---------- publish ----------
 
+/// Stretches you marked to cut in the Clip Picker.
+pub fn manual_cuts(db: &Db, sid: i64) -> Vec<(f64, f64)> {
+    db.conn()
+        .query_row("SELECT manual_cuts FROM streams WHERE id=?1", [sid], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+/// Uploads the transcript as a subtitle track, timed to the video as uploaded.
+async fn upload_captions(ctx: &Ctx, job: &Job) -> Result<String> {
+    let db = &ctx.db;
+    let p = posts::get_post(db, payload_id(job, "post")?)?;
+    let sid = p.stream_id.ok_or_else(|| anyhow!("subtitles are for full streams"))?;
+    let video_id = p.remote_id.ok_or_else(|| anyhow!("this post isn't on YouTube yet"))?;
+    let words = load_words(db, sid)?;
+    let lang: Option<String> = db.conn().query_row("SELECT language FROM transcripts WHERE stream_id=?1", [sid], |r| r.get(0))?;
+    let saved: Option<String> = db.conn().query_row("SELECT upload_parts FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
+    let parts: Vec<(f64, f64)> = match saved.and_then(|j| serde_json::from_str(&j).ok()) {
+        Some(p) => p,
+        None => {
+            // Uploaded before the kept parts were saved: work them out the same way again.
+            let (video, duration, _) = stream_file(db, sid)?;
+            let cuts: Vec<(f64, f64)> = db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [sid], |r| r.get::<_, Option<String>>(0))?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let parts = if cuts.is_empty() {
+                vec![(0.0, duration)]
+            } else {
+                db.job_progress(job.id, 0.1, "Reading keyframes");
+                render::kept_parts(duration, &cuts, &render::keyframes(&video).await?)
+            };
+            db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&parts)?])?;
+            parts
+        }
+    };
+    let srt = render::subtitles_srt(&words, &parts);
+    db.job_progress(job.id, 0.8, "Uploading subtitles");
+    publish::youtube_captions(&video_id, lang.as_deref().unwrap_or("en"), &srt).await?;
+    Ok(format!("Subtitles added ({} lines)", srt.matches(" --> ").count()))
+}
+
 /// Stretches to cut, worked out during analysis or now for streams analysed before that.
 async fn dead_air(db: &Db, job: &Job, sid: i64, video: &str, duration: f64) -> Result<Vec<(f64, f64)>> {
     let saved: Option<String> = db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
@@ -621,19 +681,24 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
         return Ok(());
     }
     let (video, duration, _) = stream_file(db, sid)?;
-    let cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
+    let mut cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
+    cuts.extend(manual_cuts(db, sid));
+    let cuts = censor::merge(cuts);
     if hits.is_empty() && cuts.is_empty() {
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&[(0.0, duration)])?])?;
         return Ok(());
     }
     let out = output_dir(ctx, sid).join("full_censored.mp4");
     let jid = job.id;
     if cuts.is_empty() {
         render::censor_full_video(&video, &out, &hits, &s.censor_style, duration, |p| db.job_progress(jid, p, "Bleeping audio")).await?;
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&[(0.0, duration)])?])?;
     } else {
         db.job_progress(job.id, 0.0, "Reading keyframes");
         let parts = render::kept_parts(duration, &cuts, &render::keyframes(&video).await?);
         let removed = duration - parts.iter().map(|(a, b)| b - a).sum::<f64>();
         render::edit_full_video(&video, &out, &parts, &hits, &s.censor_style, |p| db.job_progress(jid, p, "Cutting dead air and bleeping")).await?;
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&parts)?])?;
         db.log("info", "publish", &format!("Cut {} of dead air from the full stream", hms(removed)));
     }
     db.conn().execute("UPDATE streams SET censored_path=?2 WHERE id=?1", rusqlite::params![sid, out.to_string_lossy()])?;
@@ -684,6 +749,9 @@ async fn publish_post(ctx: &Ctx, job: &Job) -> Result<String> {
             let _ = std::fs::remove_file(c);
             db.conn().execute("UPDATE streams SET censored_path=NULL WHERE id=?1", [sid])?;
         }
+    }
+    if p.stream_id.is_some() && p.platform == "youtube" {
+        db.enqueue("upload_captions", None, &format!("{{\"post\":{id}}}"))?;
     }
     db.log("info", "publish", &format!("Published \"{}\" to {}", p.title, p.platform));
     Ok(format!("Published: {}", res.url))

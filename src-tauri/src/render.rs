@@ -15,6 +15,53 @@ pub struct Layout {
     pub facecam: [f64; 4],     // x, y, w, h as fractions of the source
 }
 
+/// Gameplay in the blurred layout fits a 1080x608 box, centred 110 px above the middle, so its
+/// bottom edge is never below this.
+const BLUR_VIDEO_BOTTOM: u32 = (1920 + 608) / 2 - 110;
+/// The webcam layout, top to bottom: a band for the hook, the webcam, the gameplay, then the
+/// band for captions. Every text has its own band, so none covers a face or the game.
+/// The gameplay band is tall enough that its window into a 16:9 recording is 1363 px of 1920
+/// wide, so it can sit beside a webcam up to 29% of the width without showing any of it.
+const HOOK_BAND: u32 = 220;
+const CAM_H: u32 = 540;
+const GAME_H: u32 = 856;
+
+impl Layout {
+    /// The webcam rectangle kept inside the frame and never empty: a box hanging off an edge
+    /// makes FFmpeg's crop fail, and one of zero size does too.
+    fn cam(&self) -> [f64; 4] {
+        let [x, y, w, h] = self.facecam;
+        let (x, y) = (x.clamp(0.0, 0.95), y.clamp(0.0, 0.95));
+        [x, y, w.clamp(0.05, 1.0 - x), h.clamp(0.05, 1.0 - y)]
+    }
+
+    /// Left edge of the gameplay window (an FFmpeg expression): centred, but moved sideways
+    /// just far enough to leave out a webcam on the left or right, so half a face isn't shown
+    /// in the gameplay under the real one. A webcam across the middle can't be avoided.
+    fn game_x(&self) -> String {
+        let [x, _, w, _] = self.cam();
+        if x + w <= 0.5 {
+            format!("max((iw-ow)/2,min(iw*{},iw-ow))", x + w)
+        } else if x >= 0.5 {
+            format!("min((iw-ow)/2,max(iw*{x}-ow,0))")
+        } else {
+            "(iw-ow)/2".into()
+        }
+    }
+
+    /// Where captions start: just under the video. They're top-aligned, so a phrase that
+    /// wraps grows down into the blurred band, never up over the video.
+    pub fn caption_top(&self) -> u32 {
+        let video_bottom = if self.kind == "facecam" { HOOK_BAND + CAM_H + GAME_H } else { BLUR_VIDEO_BOTTOM };
+        video_bottom + 40
+    }
+
+    /// Where the opening hook goes: above the video in both layouts.
+    pub fn hook_top(&self) -> u32 {
+        if self.kind == "facecam" { 40 } else { 250 }
+    }
+}
+
 // ---------- ASS captions ----------
 
 fn ts(t: f64) -> String {
@@ -30,10 +77,12 @@ fn clean(t: &str) -> String {
 /// Caption colour per speaker, in ASS order (blue, green, red). The UI uses the same colours.
 const SPEAKER_COLOURS: [&str; 6] = ["FFFFFF", "FFD84F", "B87AFF", "6BFF9C", "4DB8FF", "FFA2C9"];
 
-const ASS_HEAD: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n\
+/// `WrapStyle: 0` wraps a phrase that's too wide onto a second line; 2 (no wrapping) ran
+/// three long words off both sides of the frame.
+const ASS_HEAD: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n\
 [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-Style: Cap,Arial Black,80,&H00FFFFFF,&H000000FF,&H00101010,&H78000000,-1,0,0,0,100,100,0,0,1,7,3,2,90,90,640,1\n\
-Style: Hook,Arial Black,62,&H00FFFFFF,&H000000FF,&H00101010,&HD0101010,-1,0,0,0,100,100,0,0,3,22,0,8,90,90,250,1\n\
+Style: Cap,Arial Black,80,&H00FFFFFF,&H000000FF,&H00101010,&H78000000,-1,0,0,0,100,100,0,0,1,7,3,8,90,90,{CAPV},1\n\
+Style: Hook,Arial Black,62,&H00FFFFFF,&H000000FF,&H00101010,&HD0101010,-1,0,0,0,100,100,0,0,3,22,0,8,90,90,{HOOKV},1\n\
 Style: Thumb,Arial Black,120,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,12,6,1,60,60,60,1\n\n\
 [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
 
@@ -57,34 +106,64 @@ pub fn phrases(words: &[Word]) -> Vec<Vec<&Word>> {
     out
 }
 
+/// The longest a single word stays lit, in seconds.
+const MAX_WORD: f64 = 1.2;
+/// Caption size from the style, the room between its 90 px margins, and the spoken word's pop.
+const CAP_SIZE: f64 = 80.0;
+const CAP_ROOM: f64 = 1080.0 - 2.0 * 90.0;
+const POP: f64 = 1.28;
+/// Width of a capital in Arial Black as a share of the font size: measured 0.53 on average
+/// and 0.67 for a row of Ms, so a word sized with this fits, wide letters spilling at most
+/// into the margin.
+const CAP_CHAR_W: f64 = 0.65;
+
+/// A smaller font size for a phrase whose longest word, popped, wouldn't fit on one line
+/// (a single word can't be wrapped); None when the style's size fits.
+fn phrase_size(p: &[&Word]) -> Option<u32> {
+    let longest = p.iter().map(|w| clean(&w.t).chars().count()).max().unwrap_or(0) as f64;
+    let fits = CAP_ROOM / (longest * CAP_CHAR_W * POP);
+    (fits < CAP_SIZE).then(|| fits.floor() as u32)
+}
+
 /// Word-by-word karaoke captions for a clip starting at `clip_start` (times become clip-relative).
-pub fn captions_ass(words: &[Word], clip_start: f64, clip_end: f64, hook: Option<&str>) -> String {
-    let mut ass = ASS_HEAD.replace("{W}", "1080").replace("{H}", "1920");
+pub fn captions_ass(words: &[Word], clip_start: f64, clip_end: f64, hook: Option<&str>, caption_top: u32) -> String {
+    captions_ass_at(words, clip_start, clip_end, hook, caption_top, 250)
+}
+
+pub fn captions_ass_at(words: &[Word], clip_start: f64, clip_end: f64, hook: Option<&str>, caption_top: u32, hook_top: u32) -> String {
+    let mut ass = ASS_HEAD.replace("{W}", "1080").replace("{H}", "1920").replace("{CAPV}", &caption_top.to_string()).replace("{HOOKV}", &hook_top.to_string());
     if let Some(h) = hook.filter(|h| !h.trim().is_empty()) {
         ass.push_str(&format!("Dialogue: 1,{},{},Hook,,0,0,0,,{{\\fad(150,250)}}{}\n", ts(0.0), ts(3.2), clean(h)));
     }
+    // Bleeped words aren't shown at all, not even masked. The speech engine often stretches a
+    // word over the silence after it (one "so" lasted 10 s), which kept a phrase on screen
+    // long after it was said; no word is held longer than MAX_WORD.
     let inside: Vec<Word> = words
         .iter()
-        .filter(|w| w.s >= clip_start && w.s < clip_end)
-        .map(|w| Word { s: w.s - clip_start, e: (w.e - clip_start).min(clip_end - clip_start), t: if w.b { censor::mask(&w.t) } else { w.t.clone() }, sp: w.sp, b: w.b })
+        .filter(|w| !w.b && w.s >= clip_start && w.s < clip_end)
+        .map(|w| Word { s: w.s - clip_start, e: (w.e.min(w.s + MAX_WORD) - clip_start).min(clip_end - clip_start), t: w.t.clone(), sp: w.sp, b: false })
         .collect();
     let groups = phrases(&inside);
     for (gi, p) in groups.iter().enumerate() {
         // A phrase never outlasts the start of the next one, or libass stacks two lines.
         let next_phrase = groups.get(gi + 1).map(|n| n[0].s).unwrap_or(f64::MAX);
+        let size = phrase_size(p).map(|s| format!("{{\\fs{s}}}")).unwrap_or_default();
         for (i, w) in p.iter().enumerate() {
             let end = p.get(i + 1).map(|n| n.s).unwrap_or((w.e + 0.25).min(next_phrase)).max(w.s + 0.08);
-            // Speaker 0 keeps the white style; `\r` resets colour, so it's set again after it.
+            // Speaker 0 keeps the white style; `\r` resets colour and size, so they're set
+            // again after it.
             let colour = match w.sp as usize % SPEAKER_COLOURS.len() {
-                0 => String::new(),
-                n => format!("{{\\c&H00{}&}}", SPEAKER_COLOURS[n]),
+                0 => size.clone(),
+                n => format!("{size}{{\\c&H00{}&}}", SPEAKER_COLOURS[n]),
             };
             let text: Vec<String> = p
                 .iter()
                 .enumerate()
-                .map(|(j, x)| if j == i { format!("{{\\c&H0000E5FF&\\fscx112\\fscy112}}{}{{\\r}}{colour}", clean(&x.t)) } else { clean(&x.t) })
+                .map(|(j, x)| if j == i { format!("{{\\c&H0000E5FF&\\fscx128\\fscy128\\t(0,140,\\fscx112\\fscy112)}}{}{{\\r}}{colour}", clean(&x.t)) } else { clean(&x.t) })
                 .collect();
-            ass.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,0,,{colour}{}\n", ts(w.s), ts(end), text.join(" ")));
+            // The spoken word pops (above: big, then settling); each new phrase fades in.
+            let enter = if i == 0 { "{\\fad(90,0)}" } else { "" };
+            ass.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,0,,{enter}{colour}{}\n", ts(w.s), ts(end), text.join(" ")));
         }
     }
     ass
@@ -92,7 +171,8 @@ pub fn captions_ass(words: &[Word], clip_start: f64, clip_end: f64, hook: Option
 
 /// Big headline text for a still image (cover or thumbnail), shown for 10 s from t=0.
 fn still_ass(w: u32, h: u32, text: &str, style: &str, align_override: &str) -> String {
-    let mut ass = ASS_HEAD.replace("{W}", &w.to_string()).replace("{H}", &h.to_string());
+    // The caption and hook positions aren't used by stills, but must still be valid numbers.
+    let mut ass = ASS_HEAD.replace("{W}", &w.to_string()).replace("{H}", &h.to_string()).replace("{CAPV}", "640").replace("{HOOKV}", "250");
     // `\\q0` wraps long headlines instead of running them off the frame.
     ass.push_str(&format!("Dialogue: 0,{},{},{style},,0,0,0,,{{\\q0}}{align_override}{}\n", ts(0.0), ts(10.0), clean(text)));
     ass
@@ -102,14 +182,16 @@ fn still_ass(w: u32, h: u32, text: &str, style: &str, align_override: &str) -> S
 
 pub fn vertical_graph(layout: &Layout, subs: bool) -> String {
     let base = if layout.kind == "facecam" {
-        let [x, y, w, h] = layout.facecam;
+        let [x, y, w, h] = layout.cam();
+        let gx = layout.game_x();
         format!(
-            "[0:v]split=2[c][g];[c]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640,setsar=1[cam];\
-[g]crop='min(iw,ih*1080/1280)':ih,scale=1080:1280,setsar=1[game];[cam][game]vstack=inputs=2[base]"
+            "[0:v]split=3[c][g][b];[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=28,eq=brightness=-0.10:saturation=1.1[bg];\
+[c]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},scale=1080:{CAM_H}:force_original_aspect_ratio=increase,crop=1080:{CAM_H},setsar=1[cam];\
+[g]crop='min(iw,ih*1080/{GAME_H})':ih:'{gx}':0,scale=1080:{GAME_H},setsar=1[game];[bg][cam]overlay=0:{HOOK_BAND}[t];[t][game]overlay=0:{}+{CAM_H},setsar=1[base]", HOOK_BAND
         )
     } else {
         "[0:v]split=2[v1][v2];[v1]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=28,eq=brightness=-0.10:saturation=1.1[bg];\
-[v2]scale=1080:-2,setsar=1[fg];[bg][fg]overlay=0:(H-h)/2-110,setsar=1[base]"
+[v2]scale=1080:608:force_original_aspect_ratio=decrease,setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2-110,setsar=1[base]"
             .to_string()
     };
     if subs { format!("{base};[base]subtitles=subs.ass[out]") } else { format!("{base};[base]null[out]") }
@@ -180,7 +262,7 @@ pub fn clip_ranges(censors: &[(f64, f64)], start: f64, end: f64) -> Vec<(f64, f6
 pub async fn render_clip(j: ClipJob<'_>, progress: impl FnMut(f64)) -> Result<()> {
     std::fs::create_dir_all(&j.work)?;
     std::fs::create_dir_all(j.out.parent().unwrap())?;
-    std::fs::write(j.work.join("subs.ass"), captions_ass(j.words, j.start, j.end, j.hook))?;
+    std::fs::write(j.work.join("subs.ass"), captions_ass_at(j.words, j.start, j.end, j.hook, j.layout.caption_top(), j.layout.hook_top()))?;
     let dur = j.end - j.start;
     let ranges = clip_ranges(j.censors, j.start, j.end);
     let mut graph = vertical_graph(&j.layout, j.subtitles);
@@ -299,11 +381,13 @@ pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], cens
             // Just before the keyframe: ending exactly on it puts that frame in both pieces,
             // which gives two packets the same timestamp at the seam.
             text.push_str(&format!("outpoint {:.3}\n", b - 0.001));
+        } else {
+            text.push_str(&format!("outpoint {b:.3}\n"));
         }
     }
     std::fs::write(&list, text)?;
     let total: f64 = parts.iter().map(|(a, b)| b - a).sum();
-    let ranges: Vec<(f64, f64)> = censors.iter().filter_map(|(a, b)| Some((remap(*a, parts)?, remap(*b, parts).unwrap_or(remap(*a, parts)? + (b - a))))).collect();
+    let ranges = censor::onto_parts(censors, parts);
     let mut args: Vec<String> = vec!["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list.to_string_lossy().into()];
     if ranges.is_empty() {
         args.extend(["-map", "0:v:0", "-map", "0:a:0"].map(String::from));
@@ -317,6 +401,24 @@ pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], cens
     res?;
     std::fs::rename(&part, out)?;
     Ok(())
+}
+
+fn srt_ts(t: f64) -> String {
+    let ms = (t.max(0.0) * 1000.0).round() as u64;
+    format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+}
+
+/// A subtitle track (SRT) for a full stream as uploaded: lines of up to 10 words, times moved
+/// onto the timeline of the kept `parts`, bleeped words left out.
+pub fn subtitles_srt(words: &[Word], parts: &[(f64, f64)]) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    for l in crate::analysis::lines_of(words, 10) {
+        let (Some(a), Some(b)) = (remap(l.s, parts), remap(l.e, parts).or_else(|| remap(l.s, parts).map(|a| a + (l.e - l.s).min(5.0)))) else { continue };
+        n += 1;
+        out.push_str(&format!("{n}\n{} --> {}\n{}\n\n", srt_ts(a), srt_ts(b.max(a + 0.5)), l.text));
+    }
+    out
 }
 
 /// Headline text over a finished image (the AI thumbnail), 1280x720.
@@ -432,16 +534,18 @@ mod tests {
     #[test]
     fn captions_are_clip_relative_and_highlight_one_word() {
         let words = [w(99.0, "antes"), w(100.5, "hola"), w(100.9, "mundo"), w(200.0, "despues")];
-        let ass = captions_ass(&words, 100.0, 160.0, Some("no lo vas a creer"));
+        let ass = captions_ass(&words, 100.0, 160.0, Some("no lo vas a creer"), 1194);
         assert!(ass.contains("Hook,,0,0,0,,{\\fad(150,250)}NO LO VAS A CREER"));
-        assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:00.90,Cap,,0,0,0,,{\\c&H0000E5FF&\\fscx112\\fscy112}HOLA{\\r} MUNDO"));
+        assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:00.90,Cap,,0,0,0,,{\\fad(90,0)}{\\c&H0000E5FF&\\fscx128\\fscy128\\t(0,140,\\fscx112\\fscy112)}HOLA{\\r} MUNDO"), "{ass}");
+        assert!(ass.contains("HOLA {\\c&H0000E5FF&"), "the second word pops without a new fade");
+        assert!(ass.contains(",8,90,90,1194,1"), "captions top-aligned under the video");
         assert!(!ass.contains("ANTES") && !ass.contains("DESPUES"));
     }
 
     #[test]
     fn caption_events_never_overlap() {
         let words: Vec<Word> = (0..12).map(|i| Word { s: i as f64 * 0.5, e: i as f64 * 0.5 + 0.3, t: "w".into(), sp: 0, b: false }).collect();
-        let ass = captions_ass(&words, 0.0, 60.0, None);
+        let ass = captions_ass(&words, 0.0, 60.0, None, 1194);
         let mut spans: Vec<(String, String)> = ass
             .lines()
             .filter(|l| l.starts_with("Dialogue: 0,"))
@@ -457,7 +561,7 @@ mod tests {
     fn speakers_get_their_own_colour_and_phrases() {
         let mut words = [w(1.0, "hola"), w(1.3, "que"), w(1.6, "tal")];
         words[2].sp = 1;
-        let ass = captions_ass(&words, 0.0, 60.0, None);
+        let ass = captions_ass(&words, 0.0, 60.0, None, 1194);
         let caps: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue: 0,")).collect();
         assert_eq!(caps.len(), 3);
         assert!(!caps[0].contains("&H00FFD84F&"), "first speaker stays white");
@@ -466,11 +570,24 @@ mod tests {
     }
 
     #[test]
-    fn hand_bleeped_words_are_masked_in_captions() {
-        let mut words = [w(1.0, "secret")];
-        words[0].b = true;
-        let ass = captions_ass(&words, 0.0, 60.0, None);
-        assert!(ass.contains("S*****") && !ass.contains("SECRET"));
+    fn bleeped_words_are_left_out_of_captions() {
+        let mut words = [w(1.0, "hey"), w(1.3, "secret"), w(1.6, "there")];
+        words[1].b = true;
+        let ass = captions_ass(&words, 0.0, 60.0, None, 1194);
+        assert!(!ass.contains("SECRET") && !ass.contains("S*****") && !ass.contains('*'), "{ass}");
+        assert!(ass.contains("HEY") && ass.contains("THERE"));
+    }
+
+    #[test]
+    fn subtitle_track_follows_the_cuts_and_skips_bleeps() {
+        let mut words = vec![w(1.0, "hello"), w(1.3, "there."), w(30.0, "gone"), w(70.0, "after"), w(70.3, "n****")];
+        words[4].b = true;
+        let srt = subtitles_srt(&words, &[(0.0, 10.0), (60.0, 100.0)]);
+        assert!(srt.starts_with("1\n00:00:01,000 --> "), "{srt}");
+        assert!(srt.contains("HELLO THERE.") || srt.contains("hello there."), "{srt}");
+        assert!(!srt.contains("gone"), "words inside a cut are dropped");
+        assert!(srt.contains("00:00:20,000"), "70 s lands at 20 s after the 50 s cut: {srt}");
+        assert!(!srt.contains('*'));
     }
 
     #[test]
@@ -498,11 +615,104 @@ mod tests {
     }
 
     #[test]
+    fn no_template_placeholder_is_left_in_any_subtitle_file() {
+        for ass in [still_ass(1280, 720, "x", "Thumb", ""), captions_ass(&[w(1.0, "a")], 0.0, 9.0, Some("h"), 1194)] {
+            for p in ["{W}", "{H}", "{CAPV}", "{HOOKV}"] {
+                assert!(!ass.contains(p), "{p} left in:
+{ass}");
+            }
+        }
+    }
+
+    #[test]
+    fn captions_start_below_the_video_in_both_layouts() {
+        let blur = Layout { kind: "blur".into(), facecam: [0.0; 4] };
+        let cam = Layout { kind: "facecam".into(), facecam: [0.0; 4] };
+        assert_eq!(blur.caption_top(), 1154 + 40);
+        assert_eq!(cam.caption_top(), 220 + 540 + 856 + 40);
+        assert!(cam.hook_top() + 2 * 90 <= 220, "two hook lines fit above the webcam");
+        // Two lines, the spoken word popped to 128%, still end inside the frame.
+        assert!(cam.caption_top() as f64 + 2.0 * CAP_SIZE * 1.2 * POP <= 1920.0, "two lines fit in the band");
+    }
+
+    #[test]
     fn graphs_end_in_out_label() {
         let blur = Layout { kind: "blur".into(), facecam: [0.0; 4] };
-        let cam = Layout { kind: "facecam".into(), facecam: [0.7, 0.04, 0.28, 0.3] };
+        let cam = Layout { kind: "facecam".into(), facecam: [0.0, 0.34, 0.29, 0.28] };
         assert!(vertical_graph(&blur, true).ends_with("subtitles=subs.ass[out]"));
-        assert!(vertical_graph(&cam, false).contains("vstack=inputs=2[base]"));
+        let g = vertical_graph(&cam, false);
+        assert!(g.contains("overlay=0:220+540"), "{g}");
+        assert!(g.contains("[c]crop=iw*0.29:ih*0.28:iw*0:ih*0.34,"), "{g}");
+        assert!(g.contains(":'max((iw-ow)/2,min(iw*0.29,iw-ow))':0,"), "{g}");
+    }
+
+    /// Pixel left edge of the gameplay window for a 1920x1080 source, worked out the way
+    /// FFmpeg evaluates `game_x`.
+    fn game_left(cam: [f64; 4]) -> f64 {
+        let (iw, ow) = (1920.0, 1080.0 * 1080.0 / GAME_H as f64);
+        let [x, _, w, _] = Layout { kind: "facecam".into(), facecam: cam }.cam();
+        if x + w <= 0.5 { ((iw - ow) / 2.0).max((iw * (x + w)).min(iw - ow)) } else if x >= 0.5 { ((iw - ow) / 2.0).min((iw * x - ow).max(0.0)) } else { (iw - ow) / 2.0 }
+    }
+
+    #[test]
+    fn gameplay_window_leaves_out_the_webcam() {
+        let ow = 1080.0 * 1080.0 / GAME_H as f64;
+        // The owner's recordings: webcam at the left, 554x311 px from y=365 of 1920x1080.
+        let left = game_left([0.0, 0.34, 0.29, 0.28]);
+        assert!(left >= 554.0 && left + ow <= 1920.0, "{left}");
+        // Mirrored on the right.
+        let right = game_left([0.71, 0.04, 0.29, 0.3]);
+        assert!(right + ow <= 0.71 * 1920.0 + 1e-6 && right >= 0.0, "{right}");
+        // A small corner webcam doesn't move the game off centre more than it must.
+        assert_eq!(game_left([0.0, 0.0, 0.1, 0.2]), (1920.0 - ow) / 2.0);
+        // One across the middle can't be avoided: the game stays centred.
+        assert_eq!(game_left([0.4, 0.0, 0.2, 0.2]), (1920.0 - ow) / 2.0);
+        assert_eq!(Layout { kind: "facecam".into(), facecam: [0.4, 0.0, 0.2, 0.2] }.game_x(), "(iw-ow)/2");
+    }
+
+    #[test]
+    fn webcam_box_is_kept_inside_the_frame() {
+        let l = |r| Layout { kind: "facecam".into(), facecam: r }.cam();
+        assert_eq!(l([0.0, 0.34, 0.29, 0.28]), [0.0, 0.34, 0.29, 0.28]);
+        let [x, y, w, h] = l([0.9, 0.9, 0.5, 0.5]);
+        assert!(x + w <= 1.0 && y + h <= 1.0, "off the edge would fail the crop");
+        let [_, _, w, h] = l([1.0, 0.0, 0.0, 0.0]);
+        assert!(w > 0.0 && h > 0.0, "never empty");
+    }
+
+    fn cap_lines(ass: &str) -> Vec<(f64, f64, String)> {
+        let secs = |t: &str| { let p: Vec<f64> = t.split(':').map(|x| x.parse().unwrap()).collect(); p[0] * 3600.0 + p[1] * 60.0 + p[2] };
+        ass.lines().filter(|l| l.starts_with("Dialogue: 0,")).map(|l| { let f: Vec<&str> = l.splitn(10, ',').collect(); (secs(f[1]), secs(f[2]), f[9].to_string()) }).collect()
+    }
+
+    #[test]
+    fn a_word_stretched_over_silence_doesnt_hold_the_caption() {
+        // Real timings from clip 96: "so" ran 10 s, to the next word.
+        let words = [
+            Word { s: 5.78, e: 8.97, t: "that".into(), sp: 0, b: false },
+            Word { s: 8.97, e: 9.18, t: "guy's".into(), sp: 0, b: false },
+            Word { s: 9.18, e: 19.29, t: "so".into(), sp: 0, b: false },
+            Word { s: 19.29, e: 19.61, t: "fucking".into(), sp: 0, b: false },
+        ];
+        let caps = cap_lines(&captions_ass(&words, 0.0, 60.0, None, 1194));
+        for (s, e, text) in &caps {
+            assert!(e - s <= MAX_WORD + 0.25 + 0.01, "{text} held {s}-{e}");
+        }
+        assert!(caps.iter().all(|(s, _, t)| !(t.contains("FUCKING") && *s < 19.0)));
+        assert!(caps[0].2.contains("THAT") && !caps[0].2.contains("GUY'S"), "a 3 s gap starts a new phrase: {caps:?}");
+    }
+
+    #[test]
+    fn long_words_are_shrunk_to_fit_and_phrases_wrap() {
+        let words = [w(1.0, "extraordinariamente"), w(1.3, "rapido")];
+        let ass = captions_ass(&words, 0.0, 60.0, None, 1194);
+        assert!(ass.contains("WrapStyle: 0"), "wrapping on");
+        let size = phrase_size(&words.iter().collect::<Vec<_>>()).unwrap();
+        assert!(19.0 * CAP_CHAR_W * POP * size as f64 <= CAP_ROOM, "{size}");
+        let caps = cap_lines(&ass);
+        assert!(caps.iter().all(|(_, _, t)| t.starts_with(&format!("{{\\fad(90,0)}}{{\\fs{size}}}")) || t.starts_with(&format!("{{\\fs{size}}}"))), "{caps:?}");
+        assert!(caps[0].2.contains(&format!("{{\\r}}{{\\fs{size}}} RAPIDO")), "size set again after the reset: {}", caps[0].2);
+        assert_eq!(phrase_size(&[&w(0.0, "hola")]), None, "short words keep the style size");
     }
 
     #[test]
@@ -654,5 +864,29 @@ mod real_edit_tests {
         let got = crate::media::probe(&out.to_string_lossy()).await.unwrap().duration_s.unwrap();
         println!("expected {expected:.2} got {got:.2}");
         assert!((got - expected).abs() < 0.5);
+    }
+}
+
+/// Look at captions on a real recording: `cargo test real_captions -- --ignored` with
+/// STREAMFORGE_CAP_VIDEO and STREAMFORGE_KEEP; writes blur.mp4 and facecam.mp4.
+#[cfg(test)]
+mod real_caption_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_captions_render_in_both_layouts() {
+        let (Ok(v), Ok(k)) = (std::env::var("STREAMFORGE_CAP_VIDEO"), std::env::var("STREAMFORGE_KEEP")) else { return };
+        let text = "yo bro check this out right now we are going to the supermarket extraordinarily quickly okay";
+        let words: Vec<Word> = text.split(' ').enumerate().map(|(i, t)| Word { s: 2.0 + i as f64 * 0.45, e: 2.35 + i as f64 * 0.45, t: t.into(), sp: (i / 6) as u8 % 2, b: false }).collect();
+        for kind in ["blur", "facecam"] {
+            let out = PathBuf::from(&k).join(format!("{kind}.mp4"));
+            render_clip(
+                ClipJob { video: &v, start: 0.0, end: 12.0, words: &words, hook: Some("they did not see this coming"), layout: Layout { kind: kind.into(), facecam: crate::settings::FACECAM_DEFAULT }, subtitles: true, nvenc: true, work: PathBuf::from(&k).join(kind), out, censors: &[], censor_style: "beep" },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        }
     }
 }
