@@ -735,7 +735,8 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
     let nude = stream_nudity(ctx, job, sid, &s, &video, duration).await?;
     let nvenc = s.use_gpu && media::detect_toolchain().await.nvenc;
     let pix = render::Pixelate { regions: &nude, style: &s.nudity_censor, nvenc };
-    let mut cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
+    let category: Option<String> = db.conn().query_row("SELECT category FROM streams WHERE id=?1", [sid], |r| r.get(0)).ok().flatten();
+    let mut cuts = if s.cuts_dead_air(category.as_deref()) { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
     cuts.extend(manual_cuts(db, sid));
     let cuts = censor::merge(cuts);
     if hits.is_empty() && cuts.is_empty() && nude.is_empty() {

@@ -196,6 +196,11 @@ export default function SettingsPage() {
               </select>
             </Field>
             <Toggle checked={s.cut_dead_air} onChange={(v) => set({ cut_dead_air: v })} label="Cut dead air from full streams" hint="Removes stretches over 45 seconds where nobody talks and little happens (AFK, loading, queues). Your original recording isn't changed." />
+            {s.cut_dead_air && (
+              <Field label="Never cut these games" hint="Part of the Kick category name, separated by commas. Story games have quiet cutscenes that aren't dead air.">
+                <input className={inputCls} value={s.uncut_games.join(", ")} onChange={(e) => set({ uncut_games: e.target.value.split(",").map((g) => g.trimStart()) })} />
+              </Field>
+            )}
             <Field label="Hashtags for full streams" hint="Added at the end of each description, after the game's own hashtag. YouTube shows the first three above the title.">
               <input className={inputCls} value={s.hashtags.join(" ")} onChange={(e) => set({ hashtags: e.target.value.split(/[\s,]+/) })} />
             </Field>

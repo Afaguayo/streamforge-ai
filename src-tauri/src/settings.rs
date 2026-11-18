@@ -71,6 +71,17 @@ pub struct Settings {
     pub hashtags: Vec<String>,
     /// Cut long stretches where nothing happens from full stream uploads.
     pub cut_dead_air: bool,
+    /// Games whose full streams are never cut, matched against the Kick category (part of the
+    /// name, any case). Story games have long quiet stretches that are cutscenes, not dead air.
+    pub uncut_games: Vec<String>,
+}
+
+impl Settings {
+    /// Whether dead air should be cut from a stream of this Kick category.
+    pub fn cuts_dead_air(&self, category: Option<&str>) -> bool {
+        let cat = category.unwrap_or("").to_lowercase();
+        self.cut_dead_air && !self.uncut_games.iter().any(|g| !g.trim().is_empty() && cat.contains(&g.trim().to_lowercase()))
+    }
 }
 
 /// Empty entries are left out of descriptions.
@@ -117,6 +128,7 @@ impl Default for Settings {
             socials: Socials::default(),
             hashtags: vec!["#kick".into(), "#livestream".into(), "#gaming".into()],
             cut_dead_air: true,
+            uncut_games: vec!["Grand Theft Auto".into()],
         }
     }
 }
@@ -148,6 +160,7 @@ impl Settings {
         if !["beep", "mute"].contains(&s.censor_style.as_str()) { s.censor_style = "beep".into(); }
         if !["off", "boxes", "frame"].contains(&s.nudity_censor.as_str()) { s.nudity_censor = "off".into(); }
         s.nudity_threshold = if s.nudity_threshold.is_finite() { s.nudity_threshold.clamp(0.3, 0.95) } else { 0.8 };
+        s.uncut_games = s.uncut_games.iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
         s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
         s.hashtags = s.hashtags.iter().map(|h| crate::posts::hashtag(h)).filter(|h| h.len() > 1).collect();
         s.trend_keywords = s.trend_keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(5).collect();
@@ -158,6 +171,16 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gta_streams_are_never_cut() {
+        let s = super::Settings::default();
+        assert!(!s.cuts_dead_air(Some("Grand Theft Auto VI (GTA)")));
+        assert!(s.cuts_dead_air(Some("Deadlock")));
+        assert!(s.cuts_dead_air(None));
+        let off = super::Settings { cut_dead_air: false, ..Default::default() };
+        assert!(!off.cuts_dead_air(Some("Deadlock")));
+    }
+
     use super::*;
 
     #[test]

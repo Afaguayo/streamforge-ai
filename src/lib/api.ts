@@ -91,6 +91,7 @@ export type Settings = {
   socials: Socials;
   hashtags: string[];
   cut_dead_air: boolean;
+  uncut_games: string[];
 };
 
 export type Socials = { kick: string; tiktok: string; instagram: string; x: string; discord: string };
