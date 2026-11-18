@@ -95,6 +95,11 @@ async fn download(url: &str, dest: &Path, mut on_progress: impl FnMut(f64, u64))
     Ok(())
 }
 
+/// A plain download with no progress report.
+pub async fn download_file(url: &str, dest: &Path) -> Result<()> {
+    download(url, dest, |_, _| {}).await
+}
+
 fn unzip(zip_path: &Path, into: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
     for i in 0..archive.len() {

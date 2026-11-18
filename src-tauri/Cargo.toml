@@ -27,6 +27,7 @@ rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+ort = "=2.0.0-rc.15"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }

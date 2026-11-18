@@ -34,20 +34,22 @@ function turnsOf(words: Word[]): Turn[] {
   return out;
 }
 
-const masked = (t: string) => (t.includes("*") ? t : t[0] + "*".repeat(Math.max(t.length - 1, 1)));
+/** A bleeped word is never shown, only this marker, so it can still be un-bleeped. */
+const BLEEP = "[bleep]";
+const masked = (_t: string) => BLEEP;
 
 function Transcript({ c, onBleep }: { c: Clip; onBleep: (index: number) => void }) {
   const turns = turnsOf(c.words);
   const speakers = new Set(c.words.map((w) => w.sp)).size;
   return (
     <div className="mt-3 max-h-64 overflow-y-auto rounded-lg bg-ink-950 p-3 text-sm leading-relaxed">
-      <p className="mb-2 text-xs text-ink-500">Click a word to bleep or un-bleep it, then re-render.</p>
+      <p className="mb-2 text-xs text-ink-500">Click a word to bleep or un-bleep it, then re-render. 🔇 marks a bleeped word: it's silenced and left out of captions.</p>
       {turns.map((t) => (
         <p key={t.first} className="mb-2">
           {speakers > 1 && <span className="mr-2 text-[11px] font-semibold uppercase tracking-wider" style={{ color: speakerColour(t.sp) }}>Speaker {t.sp + 1}</span>}
           {t.words.map((w, i) => (
             <button key={i} onClick={() => onBleep(t.first + i)} title={w.b ? "Un-bleep" : "Bleep"} className={`mr-1 rounded px-0.5 hover:bg-ink-800 ${w.b ? "bg-red-950" : ""}`} style={{ color: speakerColour(t.sp) }}>
-              {w.b ? masked(w.t) : w.t}
+              {w.b ? "🔇" : w.t}
             </button>
           ))}
         </p>
@@ -103,7 +105,7 @@ function EditForm({ c, onDone }: { c: Clip; onDone: (msg: string | null) => void
       <Field label="Title"><input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
       <Field label="On-screen hook" hint="Shown for the first 3 seconds. Leave empty to use the title."><input className={inputCls} value={hook} onChange={(e) => setHook(e.target.value)} /></Field>
       {turns.length > 0 && (
-        <Field label="Captions" hint="Fix what the speech engine got wrong. Each box is one speaker's turn.">
+        <Field label="Captions" hint="Fix what the speech engine got wrong. Each box is one speaker's turn. [bleep] is a bleeped word: keep it to keep the bleep, or type one to add a bleep.">
           <div className="space-y-2">
             {turns.map((t, i) => (
               <textarea key={t.first} rows={Math.min(4, Math.ceil(texts[i].length / 80) + 1)} className={inputCls} style={{ color: speakerColour(t.sp) }} value={texts[i]}

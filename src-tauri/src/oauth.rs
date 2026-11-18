@@ -79,8 +79,8 @@ pub const PROVIDERS: &[Provider] = &[
         token_url: "https://oauth2.googleapis.com/token",
         scopes: &[
             "https://www.googleapis.com/auth/youtube.upload",
-            // Edits videos already uploaded (title, description, privacy).
-            "https://www.googleapis.com/auth/youtube",
+            // Edits uploaded videos (title, description, privacy) and uploads subtitle tracks.
+            "https://www.googleapis.com/auth/youtube.force-ssl",
             "https://www.googleapis.com/auth/youtube.readonly",
             "https://www.googleapis.com/auth/yt-analytics.readonly",
         ],

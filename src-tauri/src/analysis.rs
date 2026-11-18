@@ -538,10 +538,14 @@ pub fn retrim(own: &[Word], (old_s, old_e): (f64, f64), transcript: &[Word], sta
     out
 }
 
-/// Text for a clip, with bleeped words masked.
+/// Text for a clip. Bleeped words are left out entirely: not even a masked `n****` shows.
 pub fn words_text(words: &[Word]) -> String {
-    words.iter().map(|w| if w.b { crate::censor::mask(&w.t) } else { w.t.clone() }).collect::<Vec<_>>().join(" ")
+    words.iter().filter(|w| !w.b).map(|w| w.t.as_str()).collect::<Vec<_>>().join(" ")
 }
+
+/// How the app's own editor shows a bleeped word, so it can still be un-bleeped. Never
+/// published: captions, transcripts, titles and subtitle tracks leave the word out.
+pub const BLEEP_MARK: &str = "[bleep]";
 
 /// A line of the transcript for reading and searching: start, end, text.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -554,12 +558,17 @@ pub struct Line {
 /// Groups words into readable lines: a new line after a sentence ends, a pause of a second,
 /// or 16 words.
 pub fn lines(words: &[Word]) -> Vec<Line> {
+    lines_of(words, 16)
+}
+
+/// `lines` with a chosen word limit. Bleeped words are left out.
+pub fn lines_of(words: &[Word], max_words: usize) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     let mut count = 0;
-    for w in words {
+    for w in words.iter().filter(|w| !w.b) {
         let start_new = match out.last() {
             None => true,
-            Some(l) => count >= 16 || w.s - l.e > 1.0 || l.text.ends_with(['.', '!', '?']),
+            Some(l) => count >= max_words || w.s - l.e > 1.0 || l.text.ends_with(['.', '!', '?']),
         };
         if start_new {
             out.push(Line { s: w.s, e: w.e, text: w.t.clone() });
@@ -598,11 +607,15 @@ pub fn retext(words: &[Word], texts: &[String]) -> Result<Vec<Word>> {
         let old = &words[span];
         let new: Vec<&str> = text.split_whitespace().collect();
         if new.len() == old.len() {
-            out.extend(old.iter().zip(&new).map(|(w, t)| Word { t: t.to_string(), ..w.clone() }));
+            // A bleeped word comes back as its marker: it keeps its original word and bleep.
+            out.extend(old.iter().zip(&new).map(|(w, t)| if *t == BLEEP_MARK && w.b { w.clone() } else { Word { t: t.to_string(), ..w.clone() } }));
         } else {
             let (a, b) = (old[0].s, old[old.len() - 1].e);
             let step = (b - a) / new.len().max(1) as f64;
-            out.extend(new.iter().enumerate().map(|(i, t)| Word { s: a + i as f64 * step, e: a + (i + 1) as f64 * step, t: t.to_string(), sp: old[0].sp, b: t.contains('*') }));
+            out.extend(new.iter().enumerate().map(|(i, t)| {
+                let b = *t == BLEEP_MARK || t.contains('*');
+                Word { s: a + i as f64 * step, e: a + (i + 1) as f64 * step, t: t.to_string(), sp: old[0].sp, b }
+            }));
         }
     }
     Ok(out)
@@ -730,7 +743,7 @@ pub fn categorize(sec: &[Second], a: f64, b: f64) -> String {
 
 /// Title from the words around the peak, used when no Claude key is set.
 pub fn auto_title(words: &[Word], peak: f64) -> String {
-    let near: Vec<&str> = words.iter().filter(|w| w.s >= peak - 4.0 && w.s <= peak + 4.0).map(|w| w.t.trim()).collect();
+    let near: Vec<&str> = words.iter().filter(|w| !w.b && w.s >= peak - 4.0 && w.s <= peak + 4.0).map(|w| w.t.trim()).collect();
     let mut t = near.iter().take(9).copied().collect::<Vec<_>>().join(" ");
     t = t.trim_matches(|c: char| c == ',' || c == '.' || c == ' ').to_string();
     if t.is_empty() { "Stream highlight".into() } else { format!("\"{}\"", capitalize(&t)) }
@@ -755,6 +768,25 @@ mod tests {
 
     fn text(w: &[Word]) -> String {
         w.iter().map(|x| x.t.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn bleeped_words_never_show_in_text_lines_or_titles() {
+        let mut w = sentence(0.0, "my n**** went home");
+        w[1].b = true;
+        assert_eq!(words_text(&w), "my went home");
+        assert_eq!(lines(&w)[0].text, "my went home");
+        assert!(!auto_title(&w, 0.5).contains('*'));
+    }
+
+    #[test]
+    fn the_editor_marker_keeps_a_bleep() {
+        let mut w = sentence(0.0, "my n**** went home");
+        w[1].b = true;
+        let out = retext(&w, &["my [bleep] went home".into()]).unwrap();
+        assert!(out[1].b && out[1].t == "n****", "same word count keeps the original");
+        let out = retext(&w, &["my [bleep] went home now".into()]).unwrap();
+        assert!(out[1].b, "a respread turn still bleeps the marker");
     }
 
     #[test]

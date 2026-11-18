@@ -5,7 +5,7 @@
 //! → analyze → (render top clips, thumbnails, upload the full stream if set) → you approve
 //! clips → publish. Scheduled jobs: stats, trend report, watchlist.
 
-use crate::{analysis, censor, db::Db, jobs::{now_str, Job}, kick::{self, KickState}, llm, media, posts, publish, render, research, settings::Settings, tools};
+use crate::{analysis, censor, db::Db, jobs::{now_str, Job}, kick::{self, KickState}, llm, media, nudity, posts, publish, render, research, settings::Settings, tools};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,7 @@ async fn run(ctx: &Ctx, job: &Job) -> Result<String> {
         "render" => render_clip(ctx, job).await,
         "thumbnails" => thumbnails(ctx, job).await,
         "publish" => publish_post(ctx, job).await,
+        "upload_captions" => upload_captions(ctx, job).await,
         "update_video" => {
             let p = posts::get_post(db, payload_id(job, "post")?)?;
             let id = p.remote_id.ok_or_else(|| anyhow!("this post has no YouTube video"))?;
@@ -403,6 +404,45 @@ async fn analyze(ctx: &Ctx, job: &Job) -> Result<String> {
 
 // ---------- render ----------
 
+/// Width / height of a recording, 16:9 if it can't be read.
+async fn aspect(video: &str) -> f64 {
+    match media::probe(video).await {
+        Ok(media::ProbeInfo { width: Some(w), height: Some(h), .. }) if w > 0 && h > 0 => w as f64 / h as f64,
+        _ => 16.0 / 9.0,
+    }
+}
+
+/// On-screen nudity in `dur` seconds of the recording from `start` (to the end when `dur` is 0),
+/// on that window's own timeline. Empty when the nudity censor is off.
+async fn nudity_regions(ctx: &Ctx, s: &Settings, video: &str, start: f64, dur: f64, progress: impl FnMut(f64)) -> Result<Vec<nudity::Region>> {
+    if s.nudity_censor == "off" {
+        return Ok(Vec::new());
+    }
+    let model = nudity::ensure_model(&ctx.data_dir).await?;
+    let hits = nudity::scan(&model, video, start, dur, aspect(video).await, s.nudity_threshold as f32, progress).await?;
+    Ok(nudity::regions(&hits))
+}
+
+/// Nudity regions of a whole stream, saved next to its output so a retry doesn't scan again.
+async fn stream_nudity(ctx: &Ctx, job: &Job, sid: i64, s: &Settings, video: &str, duration: f64) -> Result<Vec<nudity::Region>> {
+    if s.nudity_censor == "off" {
+        return Ok(Vec::new());
+    }
+    let cache = output_dir(ctx, sid).join(format!("nudity_{:.2}.json", s.nudity_threshold));
+    if let Some(r) = std::fs::read_to_string(&cache).ok().and_then(|j| serde_json::from_str(&j).ok()) {
+        return Ok(r);
+    }
+    let db = &ctx.db;
+    let jid = job.id;
+    let r = nudity_regions(ctx, s, video, 0.0, duration, |p| db.job_progress(jid, p, "Checking the picture for nudity")).await?;
+    std::fs::create_dir_all(cache.parent().unwrap())?;
+    std::fs::write(&cache, serde_json::to_string(&r)?)?;
+    if !r.is_empty() {
+        db.log("info", "publish", &format!("Pixelating nudity in {} spot(s) of the full stream", r.len()));
+    }
+    Ok(r)
+}
+
 async fn render_clip(ctx: &Ctx, job: &Job) -> Result<String> {
     let db = &ctx.db;
     let id = payload_id(job, "clip")?;
@@ -432,8 +472,17 @@ async fn render_clip(ctx: &Ctx, job: &Job) -> Result<String> {
         }
     }
     let censors = ranges(&words);
+    let nude = if s.nudity_censor == "off" {
+        Vec::new()
+    } else {
+        db.job_progress(job.id, 0.03, "Checking the picture for nudity");
+        nudity_regions(ctx, &s, &video, start, end - start, |_| {}).await?
+    };
+    if !nude.is_empty() {
+        db.log("info", "render", &format!("Clip #{id}: pixelating nudity in {} spot(s)", nude.len()));
+    }
     render::render_clip(
-        render::ClipJob { video: &video, start, end, words: &words, hook: hook_text.as_deref(), layout, subtitles: s.subtitles, nvenc, work: work.clone(), out: out.clone(), censors: &censors, censor_style: &s.censor_style },
+        render::ClipJob { video: &video, start, end, words: &words, hook: hook_text.as_deref(), layout, subtitles: s.subtitles, nvenc, work: work.clone(), out: out.clone(), censors: &censors, censor_style: &s.censor_style, nudity: &nude, nudity_style: &s.nudity_censor },
         |p| db.job_progress(jid, p * 0.92, "Rendering clip"),
     )
     .await?;
@@ -441,7 +490,10 @@ async fn render_clip(ctx: &Ctx, job: &Job) -> Result<String> {
     let cover = output_dir(ctx, sid).join(format!("clip_{id}_cover.jpg"));
     let layout = render::Layout { kind: s.clip_layout.clone(), facecam: s.facecam_rect };
     let cover_text = hook_text.clone().unwrap_or_default();
-    let cover_ok = render::render_cover(&video, (start + 3.0).min(end), &cover_text, &layout, &work, &cover).await.is_ok();
+    // The cover frame avoids nudity when the clip has a clean moment, and is pixelated when it doesn't.
+    let clean = |t: f64| !nude.iter().any(|r| t - start >= r.start && t - start <= r.end);
+    let at = [3.0, 1.0, 6.0, 10.0, 15.0].iter().map(|o| (start + o).min(end)).find(|t| clean(*t));
+    let cover_ok = render::render_cover(&video, at.unwrap_or((start + 3.0).min(end)), &cover_text, &layout, at.is_none(), &work, &cover).await.is_ok();
     let _ = std::fs::remove_dir_all(&work);
     db.conn().execute(
         "UPDATE clips SET render_status='done', render_path=?2, cover_path=?3, error=NULL WHERE id=?1",
@@ -591,6 +643,48 @@ async fn download_vod(ctx: &Ctx, job: &Job) -> Result<String> {
 
 // ---------- publish ----------
 
+/// Stretches you marked to cut in the Clip Picker.
+pub fn manual_cuts(db: &Db, sid: i64) -> Vec<(f64, f64)> {
+    db.conn()
+        .query_row("SELECT manual_cuts FROM streams WHERE id=?1", [sid], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+/// Uploads the transcript as a subtitle track, timed to the video as uploaded.
+async fn upload_captions(ctx: &Ctx, job: &Job) -> Result<String> {
+    let db = &ctx.db;
+    let p = posts::get_post(db, payload_id(job, "post")?)?;
+    let sid = p.stream_id.ok_or_else(|| anyhow!("subtitles are for full streams"))?;
+    let video_id = p.remote_id.ok_or_else(|| anyhow!("this post isn't on YouTube yet"))?;
+    let words = load_words(db, sid)?;
+    let lang: Option<String> = db.conn().query_row("SELECT language FROM transcripts WHERE stream_id=?1", [sid], |r| r.get(0))?;
+    let saved: Option<String> = db.conn().query_row("SELECT upload_parts FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
+    let parts: Vec<(f64, f64)> = match saved.and_then(|j| serde_json::from_str(&j).ok()) {
+        Some(p) => p,
+        None => {
+            // Uploaded before the kept parts were saved: work them out the same way again.
+            let (video, duration, _) = stream_file(db, sid)?;
+            let cuts: Vec<(f64, f64)> = db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [sid], |r| r.get::<_, Option<String>>(0))?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let parts = if cuts.is_empty() {
+                vec![(0.0, duration)]
+            } else {
+                db.job_progress(job.id, 0.1, "Reading keyframes");
+                render::kept_parts(duration, &cuts, &render::keyframes(&video).await?)
+            };
+            db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&parts)?])?;
+            parts
+        }
+    };
+    let srt = render::subtitles_srt(&words, &parts);
+    db.job_progress(job.id, 0.8, "Uploading subtitles");
+    publish::youtube_captions(&video_id, lang.as_deref().unwrap_or("en"), &srt).await?;
+    Ok(format!("Subtitles added ({} lines)", srt.matches(" --> ").count()))
+}
+
 /// Stretches to cut, worked out during analysis or now for streams analysed before that.
 async fn dead_air(db: &Db, job: &Job, sid: i64, video: &str, duration: f64) -> Result<Vec<(f64, f64)>> {
     let saved: Option<String> = db.conn().query_row("SELECT cuts FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
@@ -621,19 +715,27 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
         return Ok(());
     }
     let (video, duration, _) = stream_file(db, sid)?;
-    let cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
-    if hits.is_empty() && cuts.is_empty() {
+    let nude = stream_nudity(ctx, job, sid, &s, &video, duration).await?;
+    let nvenc = s.use_gpu && media::detect_toolchain().await.nvenc;
+    let pix = render::Pixelate { regions: &nude, style: &s.nudity_censor, nvenc };
+    let mut cuts = if s.cut_dead_air { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
+    cuts.extend(manual_cuts(db, sid));
+    let cuts = censor::merge(cuts);
+    if hits.is_empty() && cuts.is_empty() && nude.is_empty() {
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&[(0.0, duration)])?])?;
         return Ok(());
     }
     let out = output_dir(ctx, sid).join("full_censored.mp4");
     let jid = job.id;
     if cuts.is_empty() {
-        render::censor_full_video(&video, &out, &hits, &s.censor_style, duration, |p| db.job_progress(jid, p, "Bleeping audio")).await?;
+        render::censor_full_video(&video, &out, &hits, &s.censor_style, &pix, duration, |p| db.job_progress(jid, p, if nude.is_empty() { "Bleeping audio" } else { "Pixelating nudity" })).await?;
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&[(0.0, duration)])?])?;
     } else {
         db.job_progress(job.id, 0.0, "Reading keyframes");
         let parts = render::kept_parts(duration, &cuts, &render::keyframes(&video).await?);
         let removed = duration - parts.iter().map(|(a, b)| b - a).sum::<f64>();
-        render::edit_full_video(&video, &out, &parts, &hits, &s.censor_style, |p| db.job_progress(jid, p, "Cutting dead air and bleeping")).await?;
+        render::edit_full_video(&video, &out, &parts, &hits, &s.censor_style, &pix, |p| db.job_progress(jid, p, "Cutting dead air and bleeping")).await?;
+        db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&parts)?])?;
         db.log("info", "publish", &format!("Cut {} of dead air from the full stream", hms(removed)));
     }
     db.conn().execute("UPDATE streams SET censored_path=?2 WHERE id=?1", rusqlite::params![sid, out.to_string_lossy()])?;
@@ -684,6 +786,9 @@ async fn publish_post(ctx: &Ctx, job: &Job) -> Result<String> {
             let _ = std::fs::remove_file(c);
             db.conn().execute("UPDATE streams SET censored_path=NULL WHERE id=?1", [sid])?;
         }
+    }
+    if p.stream_id.is_some() && p.platform == "youtube" {
+        db.enqueue("upload_captions", None, &format!("{{\"post\":{id}}}"))?;
     }
     db.log("info", "publish", &format!("Published \"{}\" to {}", p.title, p.platform));
     Ok(format!("Published: {}", res.url))

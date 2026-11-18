@@ -173,6 +173,18 @@ export default function SettingsPage() {
                 </Field>
               </>
             )}
+            <Field label="Nudity" hint="Scans the video on this computer (NudeNet model, about 12 MB, downloaded the first time) and pixelates exposed nudity in clips, thumbnails and full stream uploads. It can miss things or flag clothes, so check anything going public.">
+              <select className={`${inputCls} w-72`} value={s.nudity_censor} onChange={(e) => set({ nudity_censor: e.target.value as Settings["nudity_censor"] })}>
+                <option value="off">Off</option>
+                <option value="boxes">Pixelate the area</option>
+                <option value="frame">Pixelate the whole frame</option>
+              </select>
+            </Field>
+            {s.nudity_censor !== "off" && (
+              <Field label={`Confidence needed: ${Math.round(s.nudity_threshold * 100)}%`} hint="Lower catches more but also flags clothed scenes. 80% is a good start.">
+                <input type="range" min={0.3} max={0.95} step={0.05} className="w-72" value={s.nudity_threshold} onChange={(e) => set({ nudity_threshold: Number(e.target.value) })} />
+              </Field>
+            )}
           </div>
         </Card>
 

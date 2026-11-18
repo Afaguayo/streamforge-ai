@@ -50,6 +50,10 @@ pub struct Settings {
     pub censor_style: String,
     /// Extra whole words to censor.
     pub censor_words: Vec<String>,
+    /// Pixelate on-screen nudity: "off", "boxes" (just the detected areas) or "frame" (the whole picture).
+    pub nudity_censor: String,
+    /// Detector confidence needed, 0.3-0.95. Lower catches more but flags more game footage.
+    pub nudity_threshold: f64,
     /// When a Kick stream ends, upload the full stream to YouTube.
     pub auto_upload_vod: bool,
     /// YouTube privacy for those uploads: private | unlisted | public.
@@ -99,6 +103,8 @@ impl Default for Settings {
             censor_enabled: true,
             censor_style: "beep".into(),
             censor_words: Vec::new(),
+            nudity_censor: "off".into(),
+            nudity_threshold: 0.8,
             auto_upload_vod: true,
             vod_privacy: "private".into(),
             socials: Socials::default(),
@@ -127,6 +133,8 @@ impl Settings {
         if !["private", "unlisted", "public"].contains(&s.default_privacy.as_str()) { s.default_privacy = "private".into(); }
         if !["private", "unlisted", "public"].contains(&s.vod_privacy.as_str()) { s.vod_privacy = "private".into(); }
         if !["beep", "mute"].contains(&s.censor_style.as_str()) { s.censor_style = "beep".into(); }
+        if !["off", "boxes", "frame"].contains(&s.nudity_censor.as_str()) { s.nudity_censor = "off".into(); }
+        s.nudity_threshold = if s.nudity_threshold.is_finite() { s.nudity_threshold.clamp(0.3, 0.95) } else { 0.8 };
         s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
         s.hashtags = s.hashtags.iter().map(|h| crate::posts::hashtag(h)).filter(|h| h.len() > 1).collect();
         s.trend_keywords = s.trend_keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(5).collect();

@@ -82,6 +82,8 @@ export type Settings = {
   censor_enabled: boolean;
   censor_style: "beep" | "mute";
   censor_words: string[];
+  nudity_censor: "off" | "boxes" | "frame";
+  nudity_threshold: number;
   auto_upload_vod: boolean;
   vod_privacy: "private" | "unlisted" | "public";
   socials: Socials;
@@ -259,6 +261,8 @@ export const api = {
   editClipText: (id: number, turns: string[]) => invoke<void>("edit_clip_text", { id, turns }),
   streamTranscript: (id: number) => invoke<Line[]>("stream_transcript", { id }),
   createClip: (streamId: number, start: number, end: number, title: string) => invoke<number>("create_clip", { streamId, start, end, title }),
+  streamCuts: (id: number) => invoke<{ auto: [number, number][]; manual: [number, number][] }>("stream_cuts", { id }),
+  setManualCuts: (id: number, cuts: [number, number][]) => invoke<void>("set_manual_cuts", { id, cuts }),
   toggleBleep: (id: number, index: number) => invoke<void>("toggle_bleep", { id, index }),
   downloadClip: (id: number, dest: string) => invoke<void>("download_clip", { id, dest }),
   kickVods: () => invoke<KickVod[]>("list_kick_vods"),

@@ -7,6 +7,7 @@ mod jobs;
 mod kick;
 mod llm;
 mod media;
+mod nudity;
 mod oauth;
 mod pipeline;
 mod posts;
@@ -133,6 +134,8 @@ pub fn run() {
             studio::edit_clip_text,
             studio::stream_transcript,
             studio::create_clip,
+            studio::stream_cuts,
+            studio::set_manual_cuts,
             studio::toggle_bleep,
             studio::download_clip,
             studio::list_kick_vods,

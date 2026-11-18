@@ -33,6 +33,7 @@ export default function ClipPicker({ go }: { go: (p: PageId) => void }) {
   const [outAt, setOut] = useState<number | null>(null);
   const [title, setTitle] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
+  const [cuts, setCuts] = useState<{ auto: [number, number][]; manual: [number, number][] }>({ auto: [], manual: [] });
   const video = useRef<HTMLVideoElement>(null);
   const list = useRef<HTMLDivElement>(null);
 
@@ -42,7 +43,19 @@ export default function ClipPicker({ go }: { go: (p: PageId) => void }) {
     setIn(null);
     setOut(null);
     api.streamTranscript(stream.id).then(setLines).catch((e) => setMsg({ text: errorText(e), bad: true }));
+    api.streamCuts(stream.id).then(setCuts).catch(() => {});
   }, [stream?.id]);
+
+  const saveCuts = async (manual: [number, number][], ok: string) => {
+    if (!stream) return;
+    try {
+      await api.setManualCuts(stream.id, manual);
+      setCuts(await api.streamCuts(stream.id));
+      setMsg({ text: ok });
+    } catch (e) {
+      setMsg({ text: errorText(e), bad: true });
+    }
+  };
 
   const seek = (t: number) => {
     const v = video.current;
@@ -131,12 +144,15 @@ export default function ClipPicker({ go }: { go: (p: PageId) => void }) {
                 <div key={c.id} className="absolute top-1 h-6 rounded-sm bg-sky-500/50" title={c.title ?? ""}
                   style={{ left: `${(c.start_s / total) * 100}%`, width: `${Math.max(((c.end_s - c.start_s) / total) * 100, 0.3)}%` }} />
               ))}
+              {[...cuts.auto, ...cuts.manual].map(([a, b], i) => (
+                <div key={`cut${i}`} className="absolute bottom-0 h-2 rounded-sm bg-red-500/80" title="Cut from the full upload" style={{ left: `${(a / total) * 100}%`, width: `${Math.max(((b - a) / total) * 100, 0.3)}%` }} />
+              ))}
               {inAt != null && outAt != null && outAt > inAt && (
                 <div className="absolute top-0 h-8 rounded-sm bg-amber-400/40 ring-1 ring-amber-300" style={{ left: `${(inAt / total) * 100}%`, width: `${((outAt - inAt) / total) * 100}%` }} />
               )}
               <div className="absolute top-0 h-8 w-0.5 bg-white" style={{ left: `${(now / total) * 100}%` }} />
             </div>
-            <div className="text-xs text-ink-500">Blue: clips already made. Yellow: your selection. White line: where you are.</div>
+            <div className="text-xs text-ink-500">Blue: clips already made. Red: cut from the full upload (dead air and your cuts). Yellow: your selection. White line: where you are.</div>
             <Card>
               <div className="flex flex-wrap items-end gap-3">
                 <Button onClick={() => setIn(video.current?.currentTime ?? now)}>Mark in (I)</Button>
@@ -150,7 +166,23 @@ export default function ClipPicker({ go }: { go: (p: PageId) => void }) {
                   <Field label="Title (optional)"><input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="What happens in this clip" /></Field>
                 </div>
                 <Button variant="primary" disabled={!ok} onClick={create}><Scissors size={14} /> Create clip</Button>
+                <Button variant="danger" disabled={inAt == null || outAt == null || outAt <= inAt}
+                  onClick={() => inAt != null && outAt != null && saveCuts([...cuts.manual, [inAt, outAt]], "Marked to cut from the full upload. It applies to the next upload of this stream.")}>
+                  Cut from full upload
+                </Button>
               </div>
+              {cuts.manual.length > 0 && (
+                <div className="mt-3 space-y-1 text-sm">
+                  <div className="text-xs text-ink-500">Your cuts from the full upload (they apply to its next upload; one already on YouTube needs uploading again to change):</div>
+                  {cuts.manual.map(([a, b], i) => (
+                    <div key={i} className="flex items-center gap-3">
+                      <button className="tabular-nums text-sky-300 hover:underline" onClick={() => seek(a)}>{duration(a)} → {duration(b)}</button>
+                      <span className="text-ink-500">{duration(b - a)}</span>
+                      <button className="text-ink-500 hover:text-red-300" onClick={() => saveCuts(cuts.manual.filter((_, j) => j !== i), "Cut removed.")}>Remove</button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </Card>
           </div>
           <Card title="Transcript">
