@@ -7,6 +7,7 @@
   --color-ink-800: #181c25;
   --color-ink-700: #252b37;
   --color-ink-500: #5b6475;
+  --color-ink-400: #8a93a5;
   --color-ink-300: #a3abba;
   --color-ink-100: #e6e9ef;
   --color-kick: #53fc18;
@@ -26,6 +27,7 @@ body {
   background: var(--color-ink-950);
   color: var(--color-ink-100);
   font-family: var(--font-sans);
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
   user-select: none;
 }
@@ -35,6 +37,18 @@ textarea {
   user-select: text;
 }
 
+/* Every control shows where the keyboard is. */
+:focus-visible {
+  outline: 2px solid var(--color-kick);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline-offset: 0;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
 }
@@ -42,4 +56,18 @@ textarea {
   background: var(--color-ink-700);
   border-radius: 8px;
   border: 2px solid var(--color-ink-900);
+}
+
+/* Full width unless the page gives the field its own width (utilities win over this layer). */
+@layer components {
+  .field-input {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

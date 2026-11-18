@@ -202,13 +202,18 @@ fn stream_censors(db: &Db, sid: i64) -> Result<Vec<(f64, f64)>> {
     Ok(censor::merge(r))
 }
 
-/// Transcripts from before chunked transcription are full of repeats and aren't censored.
+/// Transcripts from before chunked transcription are full of repeats and aren't censored;
+/// engine 2 ones have word times up to 14 s early (whisper's `--vad` timeline mapping).
 /// Queues them once at startup; heavy work still waits while you're live.
-pub fn redo_old_transcripts(db: &Db) -> Result<usize> {
+///
+/// Engine 2 ones are only redone when the voice detection tool is installed: without it the
+/// new transcript would have the same early times, and be redone again on every start.
+pub fn redo_old_transcripts(db: &Db, data_dir: &Path) -> Result<usize> {
+    let below = if analysis::speech_detector(&tools::whisper_exe(data_dir)).is_file() { 3 } else { 2 };
     let ids: Vec<i64> = {
         let conn = db.conn();
-        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<2 AND s.file_path IS NOT NULL")?;
-        let rows = st.query_map([], |r| r.get(0))?;
+        let mut st = conn.prepare("SELECT t.stream_id FROM transcripts t JOIN streams s ON s.id=t.stream_id WHERE t.engine<?1 AND s.file_path IS NOT NULL")?;
+        let rows = st.query_map([below], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
     for id in &ids {
@@ -293,9 +298,10 @@ async fn transcribe(ctx: &Ctx, job: &Job) -> Result<String> {
     let _ = std::fs::remove_dir_all(&pieces);
     let tuples: Vec<(f64, f64, &str)> = words.iter().map(|w| (w.s, w.e, w.t.as_str())).collect();
     db.conn().execute(
-        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,2)
-         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=2, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-        rusqlite::params![sid, lang, serde_json::to_string(&tuples)?],
+        "INSERT INTO transcripts(stream_id, language, words, engine) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(stream_id) DO UPDATE SET language=excluded.language, words=excluded.words, engine=excluded.engine, created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        // Engine 3 means the times were made with the voice detection tool; without it they are engine 2's.
+        rusqlite::params![sid, lang, serde_json::to_string(&tuples)?, if analysis::speech_detector(&exe).is_file() { 3 } else { 2 }],
     )?;
     // Anything built from the old transcript is out of date.
     db.conn().execute("UPDATE streams SET censored_path=NULL, meta=NULL WHERE id=?1", [sid])?;
@@ -306,7 +312,8 @@ async fn transcribe(ctx: &Ctx, job: &Job) -> Result<String> {
         rows.collect::<Result<_, _>>()?
     };
     for (id, start, end) in approved {
-        save_clip_words(db, id, &analysis::slice_words(&words, start, end))?;
+        let old: Vec<analysis::Word> = db.conn().query_row("SELECT words FROM clips WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten().and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default();
+        save_clip_words(db, id, &analysis::keep_bleeps(analysis::slice_words(&words, start, end), &old))?;
         posts::queue_render(db, id)?;
     }
     set_stream_status(db, sid, "transcribed")?;
@@ -353,8 +360,18 @@ async fn analyze(ctx: &Ctx, job: &Job) -> Result<String> {
     let kept = {
         let conn = db.conn();
         conn.execute("DELETE FROM clips WHERE stream_id=?1 AND status='suggested'", [sid])?;
+        // On a second pass over a stream, a moment that is already a clip (approved, posted or
+        // rejected) is not suggested again: it would be rendered and could be posted twice.
+        let taken: Vec<(f64, f64)> = {
+            let mut st = conn.prepare("SELECT start_s,end_s FROM clips WHERE stream_id=?1")?;
+            let rows = st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
         let mut kept = 0;
         for (i, c) in cands.iter_mut().enumerate() {
+            if taken.iter().any(|(a, b)| c.end.min(*b) - c.start.max(*a) > (c.end - c.start) / 2.0) {
+                continue;
+            }
             let (mut sc, mut cat, mut ttl, mut hook, mut reason, mut status, mut by) =
                 (c.scores.clone(), c.category.clone(), c.title.clone(), String::new(), String::new(), "suggested", "heuristic");
             if let Some(l) = llm_scores.as_ref().and_then(|v| v.get(i)) {

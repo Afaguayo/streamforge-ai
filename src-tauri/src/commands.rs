@@ -56,6 +56,12 @@ pub fn recent_activity(st: State<AppState>) -> Res<Vec<Activity>> {
     st.db.recent_activity(100).map_err(e)
 }
 
+/// Longer slice of the activity log for the Activity page (newest first, capped at 1000).
+#[tauri::command]
+pub fn list_activity(st: State<AppState>, limit: u32) -> Res<Vec<Activity>> {
+    st.db.recent_activity(limit.clamp(1, 1000)).map_err(e)
+}
+
 #[tauri::command]
 pub fn retry_job(st: State<AppState>, id: i64) -> Res<bool> {
     st.db.job_retry(id).map_err(e)

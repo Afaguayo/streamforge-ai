@@ -1,19 +1,22 @@
 import type { PageId } from "../App";
-import { StreamStatus } from "../components/StreamBits";
+import { useJobs } from "../components/Progress";
+import { StageView } from "../components/StreamBits";
 import { Button, Card, Empty, Notice, Page } from "../components/ui";
 import { api } from "../lib/api";
 import { ago, duration } from "../lib/format";
+import { streamStage } from "../lib/stages";
 import { usePoll } from "../lib/usePoll";
 
 export default function LiveMonitor({ go }: { go: (p: PageId) => void }) {
   const { data: ov } = usePoll(api.overview);
   const { data: streams } = usePoll(api.streams, 5000);
+  const p = useJobs();
   const k = ov?.kick;
   const sessions = (streams ?? []).filter((s) => s.source === "kick");
   const liveFor = k?.live && k.started_at ? (Date.now() - Date.parse(k.started_at)) / 1000 : null;
 
   return (
-    <Page title="Live Stream Monitor" subtitle="Polls Kick's official API for your channel's live status.">
+    <Page title="Live monitor" subtitle="Polls Kick's official API for your channel's live status.">
       {!k?.configured ? (
         <Notice tone="warn">
           <div className="flex items-center justify-between gap-4">
@@ -28,7 +31,7 @@ export default function LiveMonitor({ go }: { go: (p: PageId) => void }) {
               <span className={`h-4 w-4 rounded-full ${k.live ? "animate-pulse bg-kick" : "bg-ink-500"}`} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-xs uppercase tracking-wider text-ink-500">kick.com/{k.slug}</div>
+              <div className="text-[13px] text-ink-400">kick.com/{k.slug}</div>
               <div className="mt-1 truncate text-xl font-semibold">{k.live ? k.title || "Live" : "Offline"}</div>
               <div className="mt-1 flex gap-5 text-sm text-ink-300">
                 {k.live && <span>{k.viewers ?? 0} viewers</span>}
@@ -51,19 +54,19 @@ export default function LiveMonitor({ go }: { go: (p: PageId) => void }) {
 
       <Card title="Kick sessions" className="mt-5">
         {sessions.length === 0 ? (
-          <Empty>No sessions recorded yet. They appear here when StreamForge sees you go live.</Empty>
+          <Empty title="No sessions yet">They appear here when StreamForge sees you go live on Kick.</Empty>
         ) : (
           <ul className="divide-y divide-ink-800">
             {sessions.map((s) => (
               <li key={s.id} className="flex items-center gap-4 py-3 text-sm">
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-medium">{s.title}</div>
-                  <div className="text-xs text-ink-500">
+                  <div className="text-[13px] text-ink-400">
                     started {ago(s.kick_started)}
                     {s.kick_ended && s.kick_started && ` · ${duration((Date.parse(s.kick_ended) - Date.parse(s.kick_started)) / 1000)} long`}
                   </div>
                 </div>
-                <StreamStatus s={s.status} />
+                <div className="w-72 shrink-0"><StageView stage={streamStage(s, p?.jobs ?? [], [])} compact /></div>
               </li>
             ))}
           </ul>

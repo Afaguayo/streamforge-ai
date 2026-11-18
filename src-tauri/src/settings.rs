@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 
 const KEY: &str = "app_settings";
 
+/// Where the webcam sits in the owner's OBS scene: left edge, a third of the way down,
+/// 554x311 px of 1920x1080 (measured on the recordings).
+pub const FACECAM_DEFAULT: [f64; 4] = [0.0, 0.34, 0.29, 0.28];
+/// The first default pointed at the top-right corner, which is gameplay in those recordings.
+/// Settings saved before it changed carry it, so it's treated as never set.
+const FACECAM_OLD_DEFAULT: [f64; 4] = [0.70, 0.04, 0.28, 0.30];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -93,7 +100,7 @@ impl Default for Settings {
             // Clip Studio as empty "not rendered" cards.
             auto_render_top: 12,
             clip_layout: "blur".into(),
-            facecam_rect: [0.70, 0.04, 0.28, 0.30],
+            facecam_rect: FACECAM_DEFAULT,
             subtitles: true,
             trend_keywords: Vec::new(),
             publish_platforms: vec!["youtube".into(), "tiktok".into()],
@@ -119,7 +126,13 @@ impl Settings {
         db.get_setting(KEY)
             .ok()
             .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
+            .map(|mut s| {
+                if s.facecam_rect == FACECAM_OLD_DEFAULT {
+                    s.facecam_rect = FACECAM_DEFAULT;
+                }
+                s
+            })
             .unwrap_or_default()
     }
 
@@ -159,5 +172,16 @@ mod tests {
         let s = Settings::load(&db);
         assert_eq!(s.kick_channel_slug.as_deref(), Some("mychannel"));
         assert_eq!(s.kick_poll_secs, 30);
+    }
+
+    #[test]
+    fn old_webcam_default_moves_to_the_measured_one() {
+        let db = Db::memory().unwrap();
+        db.set_setting(KEY, r#"{"clip_layout":"facecam","facecam_rect":[0.7,0.04,0.28,0.3]}"#).unwrap();
+        let s = Settings::load(&db);
+        assert_eq!(s.facecam_rect, FACECAM_DEFAULT);
+        assert_eq!(s.clip_layout, "facecam");
+        db.set_setting(KEY, r#"{"facecam_rect":[0.6,0.5,0.3,0.3]}"#).unwrap();
+        assert_eq!(Settings::load(&db).facecam_rect, [0.6, 0.5, 0.3, 0.3], "a box you set is kept");
     }
 }
