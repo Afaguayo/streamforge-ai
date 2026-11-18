@@ -5,6 +5,7 @@
 //!   isn't "always exciting";
 //! - speech density and laughter/excitement words from the transcript (ES + EN);
 //! - scene changes (FFmpeg scene score).
+//!
 //! Peaks become candidate windows of 60–120 s whose edges are moved to pauses in speech,
 //! so clips start and end on full sentences. Each candidate gets component scores; when a
 //! Claude API key is set, `llm.rs` re-scores them from the transcript.
@@ -1039,8 +1040,8 @@ mod tests {
 
     #[test]
     fn parses_speaker_turns_and_skips_other_output() {
-        let t = "Started\n0.318 -- 6.865 speaker_00\n7.0 -- 9.5 speaker_01\nElapsed seconds: 3.1\n";
-        assert_eq!(parse_turns(t), vec![(0.318, 6.865, 0), (7.0, 9.5, 1)]);
+        let t = "Started\n0.325 -- 6.865 speaker_00\n7.0 -- 9.5 speaker_01\nElapsed seconds: 3.1\n";
+        assert_eq!(parse_turns(t), vec![(0.325, 6.865, 0), (7.0, 9.5, 1)]);
     }
 
     #[test]
@@ -1196,8 +1197,8 @@ mod tests {
         let dur = 900.0;
         let words = words_every(0.5, dur, "hola");
         let mut rms = vec![-30.0; 900];
-        for i in 300..310 { rms[i] = -10.0; }
-        for i in 700..706 { rms[i] = -12.0; }
+        rms[300..310].fill(-10.0);
+        rms[700..706].fill(-12.0);
         let sec = features(dur, &rms, &words, &[]);
         let exc = excitement(&sec, &Weights::default());
         let c = candidates(&sec, &exc, &words, dur, 4);

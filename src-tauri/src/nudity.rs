@@ -176,8 +176,24 @@ pub fn shift(regions: &[Region], map: impl Fn(f64) -> Option<f64>, len: f64) -> 
         .collect()
 }
 
+/// The file name of a stream's saved scan: the threshold and the source file's path, size and
+/// modified time, so a replaced recording is scanned again.
+pub fn cache_name(video: &str, threshold: f64) -> String {
+    let meta = std::fs::metadata(video).ok();
+    let size = meta.as_ref().map_or(0, |m| m.len());
+    let mtime = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    format!("nudity_{threshold:.2}_{}.json", crate::media::short_hash(&format!("{video}|{size}|{mtime}")))
+}
+
+/// True when a scan read enough of the `expected` frames to trust (some are lost to seeking
+/// and rounding). A scan that stopped early has missed whatever came after.
+pub fn enough_frames(read: usize, expected: f64) -> bool {
+    expected <= 0.0 || read as f64 >= (expected * 0.9).floor()
+}
+
 /// Scans `dur` seconds of `video` from `start` (whole video when `dur` is 0). Hit times are
-/// relative to `start`.
+/// relative to `start`. Fails, rather than reporting a clean picture, when FFmpeg fails or
+/// stops early.
 pub async fn scan(model: &Path, video: &str, start: f64, dur: f64, aspect: f64, threshold: f32, mut progress: impl FnMut(f64)) -> Result<Vec<Hit>> {
     let model = model.to_path_buf();
     let mut session = tokio::task::spawn_blocking(move || -> Result<ort::session::Session> {
@@ -196,13 +212,24 @@ pub async fn scan(model: &Path, video: &str, start: f64, dur: f64, aspect: f64, 
         cmd.args(["-t", &format!("{dur:.3}")]);
     }
     cmd.args(["-an", "-vf", &format!("fps={FPS},scale={SIDE}:{SIDE}:force_original_aspect_ratio=decrease,pad={SIDE}:{SIDE}:0:0:black"), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("couldn't run FFmpeg")?;
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("couldn't run FFmpeg")?;
     let mut stdout = child.stdout.take().unwrap();
+    // Drained alongside, so a flood of decode errors can't fill the pipe and stall FFmpeg.
+    let mut stderr = child.stderr.take().unwrap();
+    let errors = tokio::spawn(async move {
+        let mut b = Vec::new();
+        let _ = stderr.read_to_end(&mut b).await;
+        String::from_utf8_lossy(&b).into_owned()
+    });
     let frame = SIDE * SIDE * 3;
     let total = if dur > 0.0 { (dur * FPS).ceil() } else { 0.0 };
     let mut hits = Vec::new();
     let mut n = 0usize;
     loop {
+        if crate::jobs::is_cancelled() {
+            let _ = child.kill().await;
+            return Err(crate::jobs::Cancelled.into());
+        }
         // A batch of frames per trip to the blocking pool keeps the hand-offs cheap.
         let mut batch: Vec<Vec<u8>> = Vec::new();
         for _ in 0..16 {
@@ -241,7 +268,14 @@ pub async fn scan(model: &Path, video: &str, start: f64, dur: f64, aspect: f64, 
             progress((n as f64 / total).min(1.0));
         }
     }
-    let _ = child.wait().await;
+    let status = child.wait().await?;
+    let errors = errors.await.unwrap_or_default();
+    if !status.success() {
+        return Err(anyhow!("the nudity scan's FFmpeg failed: {}", errors.lines().rev().take(3).collect::<Vec<_>>().join(" | ")));
+    }
+    if !enough_frames(n, total) {
+        return Err(anyhow!("the nudity scan read only {n} of {total} frames; the video may be damaged"));
+    }
     Ok(hits)
 }
 
@@ -339,8 +373,34 @@ mod tests {
     #[test]
     fn regions_move_onto_a_clip_timeline() {
         let r = [Region { start: 5.0, end: 8.0, bbox: [0.0; 4] }, Region { start: 50.0, end: 52.0, bbox: [0.0; 4] }];
-        let s = shift(&r, |t| (t >= 6.0 && t <= 36.0).then_some(t - 6.0), 30.0);
+        let s = shift(&r, |t| (6.0..=36.0).contains(&t).then_some(t - 6.0), 30.0);
         assert_eq!(s, vec![Region { start: 0.0, end: 2.0, bbox: [0.0; 4] }]);
+    }
+
+    #[test]
+    fn short_scans_are_not_trusted() {
+        assert!(enough_frames(120, 120.0));
+        assert!(enough_frames(108, 120.0));
+        assert!(!enough_frames(107, 120.0));
+        assert!(!enough_frames(0, 120.0));
+        assert!(enough_frames(0, 1.0), "one expected frame may be lost to seeking");
+        assert!(enough_frames(0, 0.0), "unknown length: no count to check");
+    }
+
+    #[test]
+    fn cache_name_follows_the_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = dir.path().join("a.mp4");
+        std::fs::write(&v, b"one").unwrap();
+        let v = v.to_string_lossy().to_string();
+        let a = cache_name(&v, 0.5);
+        assert!(a.starts_with("nudity_0.50_") && a.ends_with(".json"), "{a}");
+        assert_eq!(a, cache_name(&v, 0.5));
+        assert_ne!(a, cache_name(&v, 0.6));
+        std::fs::write(&v, b"a longer file").unwrap();
+        assert_ne!(a, cache_name(&v, 0.5), "a replaced file needs a new scan");
+        let w = dir.path().join("b.mp4").to_string_lossy().to_string();
+        assert_ne!(cache_name(&w, 0.5), cache_name(&v, 0.5));
     }
 
     #[test]

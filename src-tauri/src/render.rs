@@ -220,11 +220,26 @@ pub async fn run_ffmpeg(cwd: &Path, args: &[String], duration: f64, mut progress
         .context("couldn't start ffmpeg")?;
     if let Some(out) = child.stdout.take() {
         let mut lines = BufReader::new(out).lines();
-        while let Some(l) = lines.next_line().await? {
-            if let Some(us) = l.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
-                if duration > 0.0 {
-                    progress((us / 1e6 / duration).clamp(0.0, 1.0));
+        loop {
+            // Wakes at least twice a second so a cancelled job stops even when FFmpeg is quiet.
+            let next = tokio::select! {
+                l = lines.next_line() => Some(l?),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => None,
+            };
+            if crate::jobs::is_cancelled() {
+                let _ = child.kill().await;
+                return Err(crate::jobs::Cancelled.into());
+            }
+            match next {
+                Some(Some(l)) => {
+                    if let Some(us) = l.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
+                        if duration > 0.0 {
+                            progress((us / 1e6 / duration).clamp(0.0, 1.0));
+                        }
+                    }
                 }
+                Some(None) => break,
+                None => {}
             }
         }
     }
@@ -321,7 +336,10 @@ pub async fn censor_full_video(video: &str, out: &Path, ranges: &[(f64, f64)], s
     args.extend(full_video_maps(ranges, style, pix, dur));
     args.extend(["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"].map(String::from));
     args.push(part.to_string_lossy().into());
-    run_ffmpeg(dir, &args, dur, progress).await?;
+    if let Err(e) = run_ffmpeg(dir, &args, dur, progress).await {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
     std::fs::rename(&part, out)?;
     Ok(())
 }
@@ -341,7 +359,8 @@ fn full_video_maps(ranges: &[(f64, f64)], style: &str, pix: &Pixelate<'_>, dur: 
         args.extend(["-filter_complex".to_string(), graph.join(";")]);
     }
     args.extend(["-map".to_string(), if pix.regions.is_empty() { "0:v:0" } else { "[vout]" }.to_string()]);
-    args.extend(["-map".to_string(), if ranges.is_empty() { "0:a:0" } else { "[aout]" }.to_string()]);
+    // `?`: a recording without audio still copies; the bleep graph only exists when it has some.
+    args.extend(["-map".to_string(), if ranges.is_empty() { "0:a:0?" } else { "[aout]" }.to_string()]);
     if pix.regions.is_empty() {
         args.extend(["-c:v".to_string(), "copy".to_string()]);
     } else {
@@ -385,7 +404,7 @@ pub fn kept_parts(duration: f64, cuts: &[(f64, f64)], keys: &[f64]) -> Vec<(f64,
     if duration > at {
         parts.push((at, duration));
     }
-    let down = |t: f64| keys.iter().copied().filter(|k| *k <= t + 1e-6).last().unwrap_or(0.0);
+    let down = |t: f64| keys.iter().copied().rfind(|k| *k <= t + 1e-6).unwrap_or(0.0);
     let up = |t: f64| keys.iter().copied().find(|k| *k >= t - 1e-6).unwrap_or(duration);
     let mut out: Vec<(f64, f64)> = Vec::new();
     for (a, b) in parts {
@@ -414,6 +433,18 @@ pub fn remap(t: f64, parts: &[(f64, f64)]) -> Option<f64> {
     None
 }
 
+/// The parts exactly as the concat list plays them: times rounded to the millisecond written
+/// in the list, and every part but the last ending 1 ms early (see `edit_full_video`). Bleeps
+/// and pixelation are placed with these, so they don't drift 1 ms per seam.
+fn concat_parts(parts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let ms = |t: f64| (t * 1000.0).round() / 1000.0;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| (ms(*a), if i + 1 < parts.len() { ms(b - 0.001) } else { ms(*b) }))
+        .collect()
+}
+
 /// Copies only the kept parts (video untouched, audio re-encoded with any bleeps).
 pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], censors: &[(f64, f64)], style: &str, pix: &Pixelate<'_>, progress: impl FnMut(f64)) -> Result<()> {
     let dir = out.parent().ok_or_else(|| anyhow!("no output folder"))?;
@@ -422,15 +453,11 @@ pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], cens
     let list = out.with_extension(format!("{}.txt", std::process::id()));
     let src = video.replace('\\', "/").replace('\'', "'\\''");
     let mut text = String::from("ffconcat version 1.0\n");
-    for (i, (a, b)) in parts.iter().enumerate() {
-        text.push_str(&format!("file '{src}'\ninpoint {a:.3}\n"));
-        if i + 1 < parts.len() {
-            // Just before the keyframe: ending exactly on it puts that frame in both pieces,
-            // which gives two packets the same timestamp at the seam.
-            text.push_str(&format!("outpoint {:.3}\n", b - 0.001));
-        } else {
-            text.push_str(&format!("outpoint {b:.3}\n"));
-        }
+    // Each part but the last ends just before its keyframe: ending exactly on it puts that
+    // frame in both pieces, which gives two packets the same timestamp at the seam.
+    let parts = &concat_parts(parts)[..];
+    for (a, b) in parts {
+        text.push_str(&format!("file '{src}'\ninpoint {a:.3}\noutpoint {b:.3}\n"));
     }
     std::fs::write(&list, text)?;
     let total: f64 = parts.iter().map(|(a, b)| b - a).sum();
@@ -443,6 +470,9 @@ pub async fn edit_full_video(video: &str, out: &Path, parts: &[(f64, f64)], cens
     args.push(part.to_string_lossy().into());
     let res = run_ffmpeg(dir, &args, total, progress).await;
     let _ = std::fs::remove_file(&list);
+    if res.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
     res?;
     std::fs::rename(&part, out)?;
     Ok(())
@@ -535,7 +565,8 @@ pub fn thumbnail_concepts() -> [(&'static str, &'static str, &'static str); 3] {
     ]
 }
 
-pub async fn render_thumbnail(video: &str, at: f64, text: &str, concept: usize, work: &Path, out: &Path) -> Result<()> {
+/// `blur` pixelates the whole picture, for a moment that has nudity in it.
+pub async fn render_thumbnail(video: &str, at: f64, text: &str, concept: usize, blur: bool, work: &Path, out: &Path) -> Result<()> {
     std::fs::create_dir_all(work)?;
     // Thumbnails can run before any clip has made the stream's output folder.
     std::fs::create_dir_all(out.parent().ok_or_else(|| anyhow!("no output folder"))?)?;
@@ -544,7 +575,7 @@ pub async fn render_thumbnail(video: &str, at: f64, text: &str, concept: usize, 
     let args: Vec<String> = vec![
         // `thumbnail` picks the clearest frame of the 4 s around the moment, not a mid-motion blur.
         "-ss".into(), format!("{:.3}", (at - 2.0).max(0.0)), "-t".into(), "4".into(), "-i".into(), video.into(), "-frames:v".into(), "1".into(),
-        "-vf".into(), format!("fps=15,{EDGE_CROP},scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,thumbnail=50,{vf},subtitles=subs.ass"),
+        "-vf".into(), format!("fps=15,{}{EDGE_CROP},scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,thumbnail=50,{vf},subtitles=subs.ass", if blur { "pixelize=w=48:h=48," } else { "" }),
         out.to_string_lossy().into(),
     ];
     run_ffmpeg(work, &args, 0.0, |_| {}).await
@@ -567,6 +598,24 @@ pub fn headline(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concat_parts_match_the_list_so_bleeps_do_not_drift() {
+        let p = concat_parts(&[(0.0, 10.0), (20.0004, 30.0), (40.0, 50.0)]);
+        assert_eq!(p, vec![(0.0, 9.999), (20.0, 29.999), (40.0, 50.0)]);
+        // A bleep in the third part lands where the concat output plays it.
+        let at = remap(45.0, &p).unwrap();
+        assert!((at - (9.999 + 9.999 + 5.0)).abs() < 1e-9, "{at}");
+    }
+
+    #[test]
+    fn audio_map_is_optional_only_without_bleeps() {
+        let pix = Pixelate { regions: &[], style: "boxes", nvenc: false };
+        let a = full_video_maps(&[], "bleep", &pix, 10.0);
+        assert!(a.contains(&"0:a:0?".to_string()), "{a:?}");
+        let b = full_video_maps(&[(1.0, 2.0)], "bleep", &pix, 10.0);
+        assert!(b.contains(&"[aout]".to_string()) && !b.contains(&"0:a:0?".to_string()), "{b:?}");
+    }
 
     fn w(s: f64, t: &str) -> Word {
         Word { s, e: s + 0.3, t: t.into(), sp: 0, b: false }
@@ -816,10 +865,10 @@ mod ffmpeg_tests {
         render_cover(&v, 20.0, "hook text", &layout, false, &dir.path().join("c"), &cover).await.unwrap();
         assert_eq!(probe_dims(&cover).await.0, 1080);
         let thumb = dir.path().join("thumb.png");
-        render_thumbnail(&v, 20.0, "BIG MOMENT", 1, &dir.path().join("t"), &thumb).await.unwrap();
+        render_thumbnail(&v, 20.0, "BIG MOMENT", 1, false, &dir.path().join("t"), &thumb).await.unwrap();
         assert!(brightness(&thumb).await.unwrap() > 40.0, "test pattern is bright");
         let nested = dir.path().join("not").join("made").join("thumb.png");
-        render_thumbnail(&v, 20.0, "BIG MOMENT", 0, &dir.path().join("t2"), &nested).await.unwrap();
+        render_thumbnail(&v, 20.0, "BIG MOMENT", 0, false, &dir.path().join("t2"), &nested).await.unwrap();
         assert_eq!(probe_dims(&thumb).await.0, 1280);
         let keys = keyframes(&v).await.unwrap();
         assert!(keys.len() > 2, "keyframes read");
@@ -894,8 +943,8 @@ mod real_censor_tests {
             println!("{name}: heard {} + {} words, {} still the word: {left:?}", a.words.len(), b.words.len(), left.len());
             assert!(left.is_empty(), "{name}");
         }
-        render_thumbnail(&v, 20.0, "PROJECTS ZOMBOID LOVE STORY", 0, &keep.join("t"), &keep.join("thumb0.png")).await.unwrap();
-        render_thumbnail(&v, 40.0, "PROJECTS ZOMBOID LOVE STORY", 2, &keep.join("t"), &keep.join("thumb2.png")).await.unwrap();
+        render_thumbnail(&v, 20.0, "PROJECTS ZOMBOID LOVE STORY", 0, false, &keep.join("t"), &keep.join("thumb0.png")).await.unwrap();
+        render_thumbnail(&v, 40.0, "PROJECTS ZOMBOID LOVE STORY", 2, false, &keep.join("t"), &keep.join("thumb2.png")).await.unwrap();
     }
 }
 

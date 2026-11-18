@@ -2,7 +2,7 @@
 //! Instagram and Facebook are not wired up yet (Meta developer registration pending).
 
 use crate::oauth;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -45,18 +45,84 @@ async fn err_text(resp: reqwest::Response) -> String {
     format!("HTTP {status} {msg}")
 }
 
+const UPLOAD_RETRIES: u32 = 5;
+
+enum Stored {
+    Offset(u64),
+    Done(Value),
+}
+
+/// Bytes the server holds, from a 308's `Range: bytes=0-N`; no header means none.
+fn stored_offset(resp: &reqwest::Response) -> u64 {
+    resp.headers()
+        .get("range")
+        .and_then(|r| r.to_str().ok())
+        .and_then(|r| r.rsplit('-').next()?.trim().parse::<u64>().ok())
+        .map(|last| last + 1)
+        .unwrap_or(0)
+}
+
+/// Asks a resumable session how much it has stored.
+async fn youtube_stored(session: &str, size: u64) -> Result<Stored> {
+    let token = oauth::access_token(oauth::provider("youtube")?).await?;
+    let resp = http()
+        .put(session)
+        .bearer_auth(&token)
+        .header("Content-Length", 0)
+        .header("Content-Range", format!("bytes */{size}"))
+        .send()
+        .await?;
+    match resp.status().as_u16() {
+        200 | 201 => Ok(Stored::Done(resp.json().await?)),
+        308 => Ok(Stored::Offset(stored_offset(&resp))),
+        _ => bail!("YouTube upload status check failed: {}", err_text(resp).await),
+    }
+}
+
+/// YouTube rejects `<` and `>` in text fields.
+fn strip_angle(s: &str) -> String {
+    s.chars().filter(|c| *c != '<' && *c != '>').collect()
+}
+
+/// At most `max` bytes, cut on a char boundary.
+fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn yt_title(s: &str) -> String {
+    truncate(strip_angle(s).trim(), 100)
+}
+
+fn yt_description(s: &str) -> String {
+    truncate_bytes(&strip_angle(s), 5000)
+}
+
+fn yt_tags(tags: &[String]) -> Vec<String> {
+    tags.iter().map(|t| strip_angle(t)).filter(|t| !t.trim().is_empty()).collect()
+}
+
 // ---------- YouTube ----------
 
 pub async fn youtube(u: &Upload<'_>, mut progress: impl FnMut(f64)) -> Result<Published> {
     let p = oauth::provider("youtube")?;
     let size = std::fs::metadata(u.file)?.len();
+    if size == 0 {
+        bail!("the clip file is empty (0 bytes), so there is nothing to upload");
+    }
     let mut status = json!({ "privacyStatus": u.privacy, "selfDeclaredMadeForKids": false });
     if let Some(at) = u.publish_at {
         status["privacyStatus"] = json!("private");
         status["publishAt"] = json!(at);
     }
     let meta = json!({
-        "snippet": { "title": truncate(u.title, 100), "description": truncate(u.description, 4900), "tags": u.tags, "categoryId": "20" },
+        "snippet": { "title": yt_title(u.title), "description": yt_description(u.description), "tags": yt_tags(u.tags), "categoryId": "20" },
         "status": status,
     });
     let token = oauth::access_token(p).await?;
@@ -75,30 +141,46 @@ pub async fn youtube(u: &Upload<'_>, mut progress: impl FnMut(f64)) -> Result<Pu
 
     let mut f = std::fs::File::open(u.file)?;
     let mut offset = 0u64;
+    let mut failures = 0u32;
     let video: Value = loop {
         let len = CHUNK.min(size - offset);
         let body = read_chunk(&mut f, offset, len)?;
         let token = oauth::access_token(p).await?; // long uploads outlive a 1 h token
-        let resp = http()
+        let sent = http()
             .put(&session)
             .bearer_auth(&token)
             .header("Content-Length", len)
             .header("Content-Range", format!("bytes {}-{}/{}", offset, offset + len - 1, size))
             .body(body)
             .send()
-            .await
-            .context("upload interrupted")?;
+            .await;
+        let resp = match sent {
+            Ok(r) if !r.status().is_server_error() => r,
+            other => {
+                // 5xx or a dropped connection: the session survives, so ask what it stored and go on.
+                failures += 1;
+                let why = match other {
+                    Ok(r) => err_text(r).await,
+                    Err(e) => format!("{e}"),
+                };
+                if failures > UPLOAD_RETRIES {
+                    bail!("YouTube upload interrupted and didn't recover after {UPLOAD_RETRIES} retries: {why}");
+                }
+                tokio::time::sleep(Duration::from_secs(1 << failures)).await;
+                match youtube_stored(&session, size).await {
+                    Ok(Stored::Done(v)) => break v,
+                    Ok(Stored::Offset(o)) => offset = o.min(size.saturating_sub(1)),
+                    Err(_) => {} // still unreachable; the next chunk attempt counts as another retry
+                }
+                continue;
+            }
+        };
         match resp.status().as_u16() {
             200 | 201 => break resp.json().await?,
             308 => {
-                // Resume from what the server actually stored.
-                offset = resp
-                    .headers()
-                    .get("range")
-                    .and_then(|r| r.to_str().ok())
-                    .and_then(|r| r.rsplit('-').next()?.parse::<u64>().ok())
-                    .map(|last| last + 1)
-                    .unwrap_or(offset + len);
+                failures = 0;
+                // Resume from what the server actually stored (no Range header: nothing yet).
+                offset = stored_offset(&resp);
                 progress(offset as f64 / size as f64);
             }
             _ => bail!("YouTube upload failed: {}", err_text(resp).await),
@@ -210,9 +292,9 @@ pub fn update_body(video_id: &str, item: &Value, title: &str, description: &str,
     let sn = &item["snippet"];
     let st = &item["status"];
     let mut snippet = json!({
-        "title": truncate(title, 100),
-        "description": truncate(description, 4900),
-        "tags": tags,
+        "title": yt_title(title),
+        "description": yt_description(description),
+        "tags": yt_tags(tags),
         "categoryId": sn["categoryId"].as_str().unwrap_or("20"),
     });
     for k in ["defaultLanguage", "defaultAudioLanguage"] {
@@ -302,6 +384,9 @@ pub async fn tiktok(u: &Upload<'_>, mut progress: impl FnMut(f64)) -> Result<Pub
     let privacy = if options.iter().any(|o| o == wanted) { wanted.to_string() } else { options.first().cloned().unwrap_or("SELF_ONLY".into()) };
 
     let size = std::fs::metadata(u.file)?.len();
+    if size == 0 {
+        bail!("the clip file is empty (0 bytes), so there is nothing to upload");
+    }
     let (chunk, count) = tiktok_chunks(size);
     let caption = format!("{} {}", u.title, u.tags.iter().map(|t| format!("#{}", t.trim_start_matches('#'))).collect::<Vec<_>>().join(" "));
     let token = oauth::access_token(p).await?;
@@ -344,16 +429,21 @@ pub async fn tiktok(u: &Upload<'_>, mut progress: impl FnMut(f64)) -> Result<Pub
     // TikTok processes the video asynchronously.
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let token = oauth::access_token(p).await?;
-        let s: Value = http()
-            .post("https://open.tiktokapis.com/v2/post/publish/status/fetch/")
-            .bearer_auth(token)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .json(&json!({ "publish_id": publish_id }))
-            .send()
-            .await?
-            .json()
-            .await?;
+        // The upload already succeeded: a hiccup here must not fail the job (a retry would re-upload).
+        let Ok(token) = oauth::access_token(p).await else { continue };
+        let polled = async {
+            http()
+                .post("https://open.tiktokapis.com/v2/post/publish/status/fetch/")
+                .bearer_auth(token)
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .json(&json!({ "publish_id": publish_id }))
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        }
+        .await;
+        let Ok(s) = polled else { continue };
         match s["data"]["status"].as_str().unwrap_or("") {
             "PUBLISH_COMPLETE" => {
                 let post_id = s["data"]["publicaly_available_post_id"][0].as_u64().map(|v| v.to_string());
@@ -390,6 +480,17 @@ mod tests {
         assert_eq!(b["status"]["embeddable"], true);
         assert_eq!(b["status"]["license"], "creativeCommon");
         assert_eq!(b["status"]["privacyStatus"], "public");
+    }
+
+    #[test]
+    fn youtube_text_is_sanitised_and_byte_limited() {
+        assert_eq!(yt_title("a <b> c"), "a b c");
+        assert_eq!(yt_title(&"x".repeat(150)).chars().count(), 100);
+        let d = yt_description(&"é".repeat(3000)); // 6000 bytes
+        assert!(d.len() <= 5000 && d.len() >= 4998);
+        assert!(!yt_description("<script>").contains('<'));
+        assert_eq!(truncate_bytes("héllo", 2), "h", "never splits a char");
+        assert_eq!(yt_tags(&["<>".into(), "ok<".into()]), vec!["ok".to_string()]);
     }
 
     #[test]

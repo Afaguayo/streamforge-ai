@@ -21,7 +21,7 @@ import Dashboard from "./pages/Dashboard";
 import Library from "./pages/Library";
 import LiveMonitor from "./pages/LiveMonitor";
 import Connections from "./pages/Connections";
-import SettingsPage from "./pages/Settings";
+import SettingsPage, { settingsDirty } from "./pages/Settings";
 import ClipStudio from "./pages/ClipStudio";
 import Thumbnails from "./pages/Thumbnails";
 import Trends from "./pages/Trends";
@@ -34,8 +34,8 @@ import ProgressPage from "./pages/Progress";
 import ActivityPage from "./pages/Activity";
 import ClipPicker from "./pages/ClipPicker";
 import { ProgressContext, ProgressDock, useProgress } from "./components/Progress";
-import { ConfirmProvider } from "./components/ui";
-import { api } from "./lib/api";
+import { Button, ConfirmProvider, Notice } from "./components/ui";
+import { api, errorText } from "./lib/api";
 import { usePoll } from "./lib/usePoll";
 
 export type PageId =
@@ -95,15 +95,26 @@ const NAV: { group: string; items: NavItem[] }[] = [
 ];
 
 export default function App() {
-  const [page, setPage] = useState<PageId>("dashboard");
+  const [page, setPageRaw] = useState<PageId>("dashboard");
+  const [booted, setBooted] = useState(false);
+  const [bootError, setBootError] = useState<string | null>(null);
+  const [bootTry, setBootTry] = useState(0);
+  // Every navigation goes through here so unsaved Settings edits can be confirmed first.
+  const setPage = (next: PageId) => {
+    if (next !== page && page === "settings" && settingsDirty.current && !window.confirm("You have unsaved settings changes. Leave without saving?")) return;
+    setPageRaw(next);
+  };
   const progress = useProgress();
   const { data: posts } = usePoll(api.posts, 10000);
   const { data: clips } = usePoll(api.clips, 10000);
 
   // First launch opens the setup wizard until it's finished or skipped.
   useEffect(() => {
-    api.settings().then((s) => !s.onboarded && setPage("setup")).catch(() => {});
-  }, []);
+    setBootError(null);
+    api.settings()
+      .then((s) => { if (!s.onboarded) setPageRaw("setup"); setBooted(true); })
+      .catch((e) => setBootError(errorText(e)));
+  }, [bootTry]);
 
   // Numbers beside a page name mean "this needs you".
   const badge: Partial<Record<PageId, { n: number; bad?: boolean }>> = {
@@ -151,22 +162,37 @@ export default function App() {
             <div className="px-5 py-3 text-xs text-ink-500">v0.3.1</div>
           </aside>
           <main className="min-w-0 flex-1 overflow-y-auto">
-            {page === "dashboard" && <Dashboard go={setPage} />}
-            {page === "progress" && <ProgressPage p={progress} />}
-            {page === "activity" && <ActivityPage />}
-            {page === "live" && <LiveMonitor go={setPage} />}
-            {page === "library" && <Library go={setPage} />}
-            {page === "connections" && <Connections />}
-            {page === "settings" && <SettingsPage />}
-            {page === "setup" && <Setup go={setPage} />}
-            {page === "clips" && <ClipStudio go={setPage} />}
-            {page === "picker" && <ClipPicker go={setPage} />}
-            {page === "thumbnails" && <Thumbnails />}
-            {page === "trends" && <Trends />}
-            {page === "competitors" && <Competitors />}
-            {page === "calendar" && <Calendar go={setPage} />}
-            {page === "uploads" && <UploadQueue go={setPage} />}
-            {page === "analytics" && <Analytics />}
+            {!booted && (
+              <div className="p-8">
+                {bootError ? (
+                  <Notice tone="bad">
+                    <div className="flex items-center justify-between gap-4">
+                      <span>Couldn't load settings: {bootError}</span>
+                      <div className="flex gap-2">
+                        <Button onClick={() => setBootTry((n) => n + 1)}>Retry</Button>
+                        <Button onClick={() => setBooted(true)}>Continue anyway</Button>
+                      </div>
+                    </div>
+                  </Notice>
+                ) : <div className="text-sm text-ink-400">Loading…</div>}
+              </div>
+            )}
+            {booted && page === "dashboard" && <Dashboard go={setPage} />}
+            {booted && page === "progress" && <ProgressPage p={progress} />}
+            {booted && page === "activity" && <ActivityPage />}
+            {booted && page === "live" && <LiveMonitor go={setPage} />}
+            {booted && page === "library" && <Library go={setPage} />}
+            {booted && page === "connections" && <Connections />}
+            {booted && page === "settings" && <SettingsPage />}
+            {booted && page === "setup" && <Setup go={setPage} />}
+            {booted && page === "clips" && <ClipStudio go={setPage} />}
+            {booted && page === "picker" && <ClipPicker go={setPage} />}
+            {booted && page === "thumbnails" && <Thumbnails />}
+            {booted && page === "trends" && <Trends />}
+            {booted && page === "competitors" && <Competitors />}
+            {booted && page === "calendar" && <Calendar go={setPage} />}
+            {booted && page === "uploads" && <UploadQueue go={setPage} />}
+            {booted && page === "analytics" && <Analytics />}
           </main>
         </div>
       </ProgressContext.Provider>

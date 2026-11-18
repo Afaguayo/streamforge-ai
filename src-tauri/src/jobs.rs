@@ -8,9 +8,55 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub fn now_str() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+// ---------- cancelling a running job ----------
+
+tokio::task_local! {
+    /// The cancel flag of the job the current task is running.
+    static CANCEL: Arc<AtomicBool>;
+}
+
+/// Cancel flags of running jobs, by id.
+static RUNNING: Mutex<Option<HashMap<i64, Arc<AtomicBool>>>> = Mutex::new(None);
+
+/// Returned by long steps (FFmpeg, the nudity scan) when the user cancels the job.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Runs `fut` as job `id`: `is_cancelled` inside it turns true once `request_cancel(id)` is called.
+pub async fn with_cancel<F: std::future::Future>(id: i64, fut: F) -> F::Output {
+    let flag = Arc::new(AtomicBool::new(false));
+    RUNNING.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, flag.clone());
+    let out = CANCEL.scope(flag, fut).await;
+    if let Some(m) = RUNNING.lock().unwrap().as_mut() {
+        m.remove(&id);
+    }
+    out
+}
+
+/// True when the job the current task runs was cancelled.
+pub fn is_cancelled() -> bool {
+    CANCEL.try_with(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
+/// Flags running job `id` for cancelling. False when it isn't running in this process.
+fn request_cancel(id: i64) -> bool {
+    RUNNING.lock().unwrap().as_ref().and_then(|m| m.get(&id)).map(|f| f.store(true, Ordering::Relaxed)).is_some()
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -120,8 +166,9 @@ impl Db {
     }
 
     pub fn job_done(&self, id: i64, message: &str) -> Result<()> {
+        // A job cancelled in its last moments stays cancelled.
         self.conn().execute(
-            "UPDATE jobs SET status='done', progress=1, message=?2, updated_at=?3 WHERE id=?1",
+            "UPDATE jobs SET status='done', progress=1, message=?2, updated_at=?3 WHERE id=?1 AND status='running'",
             params![id, message, now_str()],
         )?;
         Ok(())
@@ -155,11 +202,14 @@ impl Db {
         )? > 0)
     }
 
+    /// Cancels a queued job, or a running one (its FFmpeg or scan is stopped).
     pub fn job_cancel(&self, id: i64) -> Result<bool> {
-        Ok(self.conn().execute(
-            "UPDATE jobs SET status='cancelled', updated_at=?2 WHERE id=?1 AND status='queued'",
+        let n = self.conn().execute(
+            "UPDATE jobs SET status='cancelled', message='Cancelled', updated_at=?2 WHERE id=?1 AND status IN ('queued','running')",
             params![id, now_str()],
-        )? > 0)
+        )?;
+        request_cancel(id);
+        Ok(n > 0)
     }
 
     /// Removes failed and cancelled jobs from the list. Returns how many.
@@ -248,6 +298,22 @@ mod tests {
         let left: Vec<String> = db.list_jobs(10).unwrap().into_iter().map(|j| j.kind).collect();
         assert_eq!(left.len(), 2);
         assert!(left.contains(&"c".to_string()) && left.contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn cancelling_a_running_job_flags_it_and_keeps_it_cancelled() {
+        let db = Db::memory().unwrap();
+        db.enqueue("render", None, "{}").unwrap();
+        let job = db.claim_next().unwrap().unwrap();
+        let seen = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(with_cancel(job.id, async {
+            assert!(!is_cancelled());
+            assert!(db.job_cancel(job.id).unwrap());
+            is_cancelled()
+        }));
+        assert!(seen, "the running task must see the cancel");
+        assert!(!is_cancelled(), "no flag outside a job");
+        db.job_done(job.id, "late").unwrap();
+        assert_eq!(db.list_jobs(10).unwrap()[0].status, "cancelled");
     }
 
     #[test]

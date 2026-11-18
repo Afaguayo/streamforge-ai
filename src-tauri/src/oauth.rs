@@ -363,18 +363,46 @@ async fn refresh(p: &Provider, t: &TokenSet) -> Result<TokenSet> {
     Ok(new)
 }
 
+/// One lock per provider (same order as `PROVIDERS`): refresh tokens may rotate, so two
+/// concurrent refreshes would burn the token the other one just stored.
+static REFRESH_LOCKS: [tokio::sync::Mutex<()>; 4] =
+    [tokio::sync::Mutex::const_new(()), tokio::sync::Mutex::const_new(()), tokio::sync::Mutex::const_new(()), tokio::sync::Mutex::const_new(())];
+
 /// A valid access token, refreshed if it expires within 2 minutes. Used by uploads.
 pub async fn access_token(p: &Provider) -> Result<String> {
     let t = load_tokens(p)?.ok_or_else(|| anyhow!("{} isn't connected", p.name))?;
-    if t.expires_at.is_some_and(|e| e - 120 < unix_now()) {
-        if p.id == "meta" {
-            bail!("Facebook sign-in expired (they last about 60 days); sign in again");
-        }
-        let new = refresh(p, &t).await?;
-        store_tokens(p, &new)?;
-        return Ok(new.access_token);
+    if !t.expires_at.is_some_and(|e| e - 120 < unix_now()) {
+        return Ok(t.access_token);
     }
-    Ok(t.access_token)
+    if p.id == "meta" {
+        bail!("Facebook sign-in expired (they last about 60 days); sign in again");
+    }
+    let idx = PROVIDERS.iter().position(|x| x.id == p.id).unwrap_or(0);
+    let _guard = REFRESH_LOCKS[idx].lock().await;
+    // Another task may have refreshed while this one waited for the lock.
+    let t = load_tokens(p)?.ok_or_else(|| anyhow!("{} isn't connected", p.name))?;
+    if !t.expires_at.is_some_and(|e| e - 120 < unix_now()) {
+        return Ok(t.access_token);
+    }
+    let new = refresh(p, &t).await?;
+    store_tokens(p, &new)?;
+    Ok(new.access_token)
+}
+
+fn record_error(db: &Db, p: &Provider, e: &anyhow::Error) {
+    let _ = db.conn().execute(
+        "UPDATE accounts SET last_check=?2, last_error=?3 WHERE platform=?1",
+        rusqlite::params![p.id, now_str(), format!("{e:#}")],
+    );
+}
+
+/// `access_token`, noting a failed refresh in `accounts.last_error` so the Accounts page shows it.
+pub async fn access_token_db(db: &Db, p: &Provider) -> Result<String> {
+    let r = access_token(p).await;
+    if let Err(e) = &r {
+        record_error(db, p, e);
+    }
+    r
 }
 
 // ---------- account info ----------
@@ -529,10 +557,7 @@ pub async fn check(db: &Db, p: &Provider) -> Result<String> {
     }
     .await;
     if let Err(e) = &result {
-        let _ = db.conn().execute(
-            "UPDATE accounts SET last_check=?2, last_error=?3 WHERE platform=?1",
-            rusqlite::params![p.id, now_str(), format!("{e:#}")],
-        );
+        record_error(db, p, e);
     }
     result
 }

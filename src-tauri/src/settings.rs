@@ -133,6 +133,27 @@ impl Default for Settings {
     }
 }
 
+/// Platform ids a clip can be drafted for (the ones `posts` knows about).
+const PLATFORMS: [&str; 4] = ["youtube", "tiktok", "instagram", "facebook"];
+
+/// Each value into 0..=1; a NaN anywhere means the whole box was never set properly.
+fn clamp_rect(r: [f64; 4]) -> [f64; 4] {
+    if r.iter().any(|v| v.is_nan()) {
+        return FACECAM_DEFAULT;
+    }
+    r.map(|v| v.clamp(0.0, 1.0))
+}
+
+/// `mychannel` from `mychannel`, `@MyChannel`, or any kick.com URL form (scheme, www., path, query, fragment).
+fn kick_slug(v: &str) -> String {
+    let v = v.trim();
+    let v = v.split_once("://").map_or(v, |(_, rest)| rest);
+    let v = v.split(['?', '#']).next().unwrap_or("");
+    let v = v.strip_prefix("www.").unwrap_or(v);
+    let v = v.strip_prefix("kick.com").unwrap_or(v);
+    v.trim_matches('/').split('/').next().unwrap_or("").trim_start_matches('@').to_lowercase()
+}
+
 impl Settings {
     pub fn load(db: &Db) -> Settings {
         db.get_setting(KEY)
@@ -161,10 +182,15 @@ impl Settings {
         if !["off", "boxes", "frame"].contains(&s.nudity_censor.as_str()) { s.nudity_censor = "off".into(); }
         s.nudity_threshold = if s.nudity_threshold.is_finite() { s.nudity_threshold.clamp(0.3, 0.95) } else { 0.8 };
         s.uncut_games = s.uncut_games.iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
-        s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+        s.censor_words = s.censor_words.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(500).collect();
+        s.facecam_rect = clamp_rect(s.facecam_rect);
+        s.publish_platforms = s.publish_platforms.iter().map(|p| p.trim().to_lowercase()).filter(|p| PLATFORMS.contains(&p.as_str())).fold(Vec::new(), |mut v, p| {
+            if !v.contains(&p) { v.push(p); }
+            v
+        });
         s.hashtags = s.hashtags.iter().map(|h| crate::posts::hashtag(h)).filter(|h| h.len() > 1).collect();
         s.trend_keywords = s.trend_keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).take(5).collect();
-        s.kick_channel_slug = s.kick_channel_slug.map(|v| v.trim().trim_start_matches("https://kick.com/").trim_matches('/').to_lowercase()).filter(|v| !v.is_empty());
+        s.kick_channel_slug = s.kick_channel_slug.map(|v| kick_slug(&v)).filter(|v| !v.is_empty());
         db.set_setting(KEY, &serde_json::to_string(&s)?)
     }
 }
@@ -182,6 +208,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn kick_slug_accepts_any_url_form() {
+        for i in ["MyChannel", " https://kick.com/MyChannel/ ", "http://www.kick.com/mychannel?x=1", "kick.com/mychannel#a", "https://kick.com/mychannel/videos", "@mychannel"] {
+            assert_eq!(kick_slug(i), "mychannel", "{i}");
+        }
+    }
+
+    #[test]
+    fn facecam_rect_is_clamped_and_nan_rejected() {
+        assert_eq!(clamp_rect([-1.0, 0.5, 2.0, 1.0]), [0.0, 0.5, 1.0, 1.0]);
+        assert_eq!(clamp_rect([0.1, f64::NAN, 0.2, 0.3]), FACECAM_DEFAULT);
+    }
+
+    #[test]
+    fn save_filters_platforms_and_caps_censor_words() {
+        let db = Db::memory().unwrap();
+        let s = Settings {
+            publish_platforms: vec!["YouTube".into(), "myspace".into(), "youtube".into()],
+            censor_words: (0..600).map(|i| format!("w{i}")).collect(),
+            ..Default::default()
+        };
+        s.save(&db).unwrap();
+        let s = Settings::load(&db);
+        assert_eq!(s.publish_platforms, vec!["youtube".to_string()]);
+        assert_eq!(s.censor_words.len(), 500);
+    }
 
     #[test]
     fn defaults_then_roundtrip_with_normalisation() {

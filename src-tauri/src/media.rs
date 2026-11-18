@@ -44,6 +44,12 @@ pub fn end_helpers_with_app() -> Result<()> {
 }
 
 /// A command that never flashes a console window on Windows.
+/// 16 hex digits of the SHA-256 of `s`: a short, stable cache key.
+pub fn short_hash(s: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn hidden(program: &str) -> Command {
     let mut c = Command::new(program);
     #[cfg(windows)]

@@ -31,21 +31,26 @@ pub async fn worker_loop(ctx: Ctx, kick: Arc<Mutex<KickState>>) {
         match db.claim_next() {
             Ok(Some(job)) if hold_heavy && is_heavy(&job.kind) => {
                 let _ = db.conn().execute(
-                    "UPDATE jobs SET status='queued', attempts=attempts-1, message='Paused while you are live' WHERE id=?1",
+                    // Held back a minute, so lighter jobs behind it in the queue still run.
+                    "UPDATE jobs SET status='queued', attempts=attempts-1, message='Paused while you are live', run_after=strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 minutes') WHERE id=?1 AND status='running'",
                     [job.id],
                 );
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             Ok(Some(job)) if is_heavy(&job.kind) && low_disk(&ctx) => {
                 let _ = db.conn().execute(
-                    "UPDATE jobs SET status='queued', attempts=attempts-1, message='Waiting: less than 2 GB free disk space', run_after=strftime('%Y-%m-%dT%H:%M:%SZ','now','+5 minutes') WHERE id=?1",
+                    "UPDATE jobs SET status='queued', attempts=attempts-1, message='Waiting: less than 2 GB free disk space', run_after=strftime('%Y-%m-%dT%H:%M:%SZ','now','+5 minutes') WHERE id=?1 AND status='running'",
                     [job.id],
                 );
                 db.log("warn", "disk", "Processing paused: less than 2 GB free. Free up space or change the output folder in Settings.");
             }
-            Ok(Some(job)) => match run(&ctx, &job).await {
+            Ok(Some(job)) => match crate::jobs::with_cancel(job.id, run(&ctx, &job)).await {
                 Ok(msg) => {
                     let _ = db.job_done(job.id, &msg);
+                }
+                Err(e) if was_cancelled(&db, job.id, &e) => {
+                    db.log("info", &job.kind, &format!("Job #{} cancelled", job.id));
+                    on_cancel(&db, &job);
                 }
                 Err(e) => {
                     let err = format!("{e:#}");
@@ -63,6 +68,12 @@ pub async fn worker_loop(ctx: Ctx, kick: Arc<Mutex<KickState>>) {
     }
 }
 
+/// A job the user cancelled ends as cancelled, not as a failure to retry.
+fn was_cancelled(db: &Db, id: i64, e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<crate::jobs::Cancelled>())
+        || db.conn().query_row("SELECT status FROM jobs WHERE id=?1", [id], |r| r.get::<_, String>(0)).is_ok_and(|s| s == "cancelled")
+}
+
 fn low_disk(ctx: &Ctx) -> bool {
     let out = Settings::load(&ctx.db).output_dir.unwrap_or_else(|| ctx.data_dir.to_string_lossy().to_string());
     [out, ctx.data_dir.to_string_lossy().to_string()].iter().any(|p| media::disk_space(p).is_some_and(|(free, _)| free < 2_000_000_000))
@@ -70,6 +81,23 @@ fn low_disk(ctx: &Ctx) -> bool {
 
 fn payload_id(job: &Job, key: &str) -> Result<i64> {
     serde_json::from_str::<Value>(&job.payload)?[key].as_i64().ok_or_else(|| anyhow!("job has no {key}"))
+}
+
+/// A cancelled render or upload must not leave its clip or post stuck in a working state.
+fn on_cancel(db: &Db, job: &Job) {
+    match job.kind.as_str() {
+        "render" => {
+            if let Ok(id) = payload_id(job, "clip") {
+                let _ = db.conn().execute("UPDATE clips SET render_status='error', error='Cancelled' WHERE id=?1 AND render_status!='done'", [id]);
+            }
+        }
+        "publish" => {
+            if let Ok(id) = payload_id(job, "post") {
+                let _ = db.conn().execute("UPDATE posts SET status='failed', error='Cancelled' WHERE id=?1 AND status='uploading'", [id]);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn on_failure(db: &Db, job: &Job, err: &str) {
@@ -445,7 +473,7 @@ async fn stream_nudity(ctx: &Ctx, job: &Job, sid: i64, s: &Settings, video: &str
     if s.nudity_censor == "off" {
         return Ok(Vec::new());
     }
-    let cache = output_dir(ctx, sid).join(format!("nudity_{:.2}.json", s.nudity_threshold));
+    let cache = output_dir(ctx, sid).join(nudity::cache_name(video, s.nudity_threshold));
     if let Some(r) = std::fs::read_to_string(&cache).ok().and_then(|j| serde_json::from_str(&j).ok()) {
         return Ok(r);
     }
@@ -544,13 +572,20 @@ async fn thumbnails(ctx: &Ctx, job: &Job) -> Result<String> {
     db.conn().execute("DELETE FROM thumbnails WHERE stream_id=?1", [sid])?;
     let dir = output_dir(ctx, sid);
     let work = work_dir(ctx, sid).join("thumbs");
+    let s = Settings::load(db);
+    let mut ai_at = None;
     for (rank, (start, end)) in picks.iter().enumerate() {
         db.job_progress(job.id, rank as f64 / picks.len() as f64, "Composing thumbnails");
-        let at = (start + 35.0).min(end - 1.0); // the peak sits ~35 s after the clip start
+        // Nudity in this moment, on its own timeline (none when the censor is off).
+        let nude = nudity_regions(ctx, &s, &video, *start, end - start, |_| {}).await?;
+        let (times, blur) = thumb_times(*start, *end, &nude);
+        if rank == 0 && !blur {
+            ai_at = times.first().copied();
+        }
         let out = dir.join(format!("thumb_{}.png", rank + 1));
         // A dark frame (loading screen, fade) makes a dead thumbnail: try a little later.
-        for step in 0..4 {
-            render::render_thumbnail(&video, (at + step as f64 * 15.0).min(end - 1.0), &text, rank, &work, &out).await?;
+        for at in times {
+            render::render_thumbnail(&video, at, &text, rank, blur, &work, &out).await?;
             if render::brightness(&out).await.map_or(true, |b| b >= DARK) {
                 break;
             }
@@ -571,16 +606,17 @@ async fn thumbnails(ctx: &Ctx, job: &Job) -> Result<String> {
     let mut best: Option<(i64, f64)> = None;
     for (id, path) in &made {
         let b = render::brightness(Path::new(path)).await.unwrap_or(0.0);
-        if best.map_or(true, |(_, x)| b > x + 5.0) {
+        if best.is_none_or(|(_, x)| b > x + 5.0) {
             best = Some((*id, b));
         }
     }
     if let Some((id, _)) = best {
         db.conn().execute("UPDATE thumbnails SET selected=(id=?1) WHERE stream_id=?2", rusqlite::params![id, sid])?;
     }
-    let ai = if llm::gemini_available() {
+    let ai = if let (true, Some(at)) = (llm::gemini_available(), ai_at) {
         db.job_progress(job.id, 0.9, "Making the AI thumbnail");
-        match ai_thumbnail(db, &video, picks[0], &text, &meta.title, sid, &dir, &work).await {
+        // Only a nudity-free frame goes to Gemini: `ai_at` is None when the moment has none.
+        match ai_thumbnail(db, &video, at, &text, &meta.title, sid, &dir, &work).await {
             Ok(()) => " + AI thumbnail",
             Err(e) => {
                 db.log("warn", "thumbnails", &format!("AI thumbnail skipped: {e:#}"));
@@ -595,12 +631,30 @@ async fn thumbnails(ctx: &Ctx, job: &Job) -> Result<String> {
     Ok(format!("{} thumbnail concepts{ai}", picks.len()))
 }
 
+/// Up to four times in a moment to take its thumbnail from, best first: ~35 s in (where the
+/// peak sits), then 15 s steps for dark frames. A frame is read from the 4 s around its time,
+/// so a time near nudity (`nude`, on the moment's timeline) is skipped. With no clean time
+/// at all, the usual times come back with `true`: pixelate the whole picture.
+fn thumb_times(start: f64, end: f64, nude: &[nudity::Region]) -> (Vec<f64>, bool) {
+    let clean = |t: f64| !nude.iter().any(|r| r.start <= t - start + 2.0 && r.end >= t - start - 2.0);
+    let last = (end - 1.0).max(start);
+    let usual: Vec<f64> = (0..4).map(|k| (start + 35.0 + k as f64 * 15.0).min(last)).collect();
+    let spread = (0..).map(|k| start + 2.0 + k as f64 * 5.0).take_while(|t| *t <= last);
+    let mut times: Vec<f64> = usual.iter().copied().chain(spread).filter(|t| clean(*t)).collect();
+    times.dedup();
+    times.truncate(4);
+    if times.is_empty() {
+        return (usual, true);
+    }
+    (times, false)
+}
+
 /// Gemini restyles the strongest moment's frame; FFmpeg puts the headline on it. Becomes the
 /// selected thumbnail.
 #[allow(clippy::too_many_arguments)]
-async fn ai_thumbnail(db: &Db, video: &str, (start, end): (f64, f64), text: &str, title: &str, sid: i64, dir: &Path, work: &Path) -> Result<()> {
+async fn ai_thumbnail(db: &Db, video: &str, at: f64, text: &str, title: &str, sid: i64, dir: &Path, work: &Path) -> Result<()> {
     let frame = work.join("ai_frame.jpg");
-    render::plain_frame(video, (start + 35.0).min(end - 1.0), &frame).await?;
+    render::plain_frame(video, at, &frame).await?;
     let category: Option<String> = db.conn().query_row("SELECT category FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
     let png = llm::ai_thumbnail(&std::fs::read(&frame)?, category.as_deref().unwrap_or("the game"), title).await?;
     let raw = work.join("ai_raw.png");
@@ -646,7 +700,10 @@ async fn download_vod(ctx: &Ctx, job: &Job) -> Result<String> {
         .chain([part.to_string_lossy().to_string()])
         .collect();
     let jid = job.id;
-    render::run_ffmpeg(&dir, &args, duration, |p| db.job_progress(jid, p, "Downloading from Kick")).await?;
+    if let Err(e) = render::run_ffmpeg(&dir, &args, duration, |p| db.job_progress(jid, p, "Downloading from Kick")).await {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
     std::fs::rename(&part, &dest)?;
     let size = std::fs::metadata(&dest)?.len() as i64;
     db.conn().execute(
@@ -726,24 +783,31 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
     if s.censor_enabled && engine.unwrap_or(0) < 2 {
         return Err(anyhow!("this stream hasn't been through the censor yet; wait for transcription to finish"));
     }
-    let hits = stream_censors(db, sid).unwrap_or_default();
+    // A stream whose bleeps can't be read must not go out unbleeped.
+    let hits = if s.censor_enabled { stream_censors(db, sid)? } else { stream_censors(db, sid).unwrap_or_default() };
     let have: Option<String> = db.conn().query_row("SELECT censored_path FROM streams WHERE id=?1", [sid], |r| r.get(0))?;
-    if have.is_some_and(|p| Path::new(&p).is_file()) {
-        return Ok(());
-    }
     let (video, duration, _) = stream_file(db, sid)?;
-    let nude = stream_nudity(ctx, job, sid, &s, &video, duration).await?;
-    let nvenc = s.use_gpu && media::detect_toolchain().await.nvenc;
-    let pix = render::Pixelate { regions: &nude, style: &s.nudity_censor, nvenc };
     let category: Option<String> = db.conn().query_row("SELECT category FROM streams WHERE id=?1", [sid], |r| r.get(0)).ok().flatten();
     let mut cuts = if s.cuts_dead_air(category.as_deref()) { dead_air(db, job, sid, &video, duration).await? } else { Vec::new() };
     cuts.extend(manual_cuts(db, sid));
     let cuts = censor::merge(cuts);
+    // The copy is named after everything that shapes it, so a changed bleep, cut or setting
+    // makes a new one instead of reusing a stale one.
+    let out = output_dir(ctx, sid).join(format!("full_censored_{}.mp4", censored_key(&video, &hits, &cuts, &s)));
+    if let Some(old) = have {
+        if Path::new(&old) == out && out.is_file() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&old);
+        db.conn().execute("UPDATE streams SET censored_path=NULL WHERE id=?1", [sid])?;
+    }
+    let nude = stream_nudity(ctx, job, sid, &s, &video, duration).await?;
+    let nvenc = s.use_gpu && media::detect_toolchain().await.nvenc;
+    let pix = render::Pixelate { regions: &nude, style: &s.nudity_censor, nvenc };
     if hits.is_empty() && cuts.is_empty() && nude.is_empty() {
         db.conn().execute("UPDATE streams SET upload_parts=?2 WHERE id=?1", rusqlite::params![sid, serde_json::to_string(&[(0.0, duration)])?])?;
         return Ok(());
     }
-    let out = output_dir(ctx, sid).join("full_censored.mp4");
     let jid = job.id;
     if cuts.is_empty() {
         render::censor_full_video(&video, &out, &hits, &s.censor_style, &pix, duration, |p| db.job_progress(jid, p, if nude.is_empty() { "Bleeping audio" } else { "Pixelating nudity" })).await?;
@@ -760,6 +824,16 @@ async fn censor_stream(ctx: &Ctx, job: &Job, sid: i64) -> Result<()> {
     Ok(())
 }
 
+/// Short key of the inputs of a stream's censored copy: the source file (path, size, modified
+/// time), the bleeps, the cuts and the settings that change the picture or sound.
+fn censored_key(video: &str, hits: &[(f64, f64)], cuts: &[(f64, f64)], s: &Settings) -> String {
+    let meta = std::fs::metadata(video).ok();
+    let size = meta.as_ref().map_or(0, |m| m.len());
+    let mtime = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let thr = if s.nudity_censor == "off" { String::new() } else { format!("{:.2}", s.nudity_threshold) };
+    media::short_hash(&format!("{video}|{size}|{mtime}|{hits:?}|{cuts:?}|{}|{}|{thr}", s.censor_style, s.nudity_censor))
+}
+
 async fn publish_post(ctx: &Ctx, job: &Job) -> Result<String> {
     let db = &ctx.db;
     let id = payload_id(job, "post")?;
@@ -771,6 +845,10 @@ async fn publish_post(ctx: &Ctx, job: &Job) -> Result<String> {
         censor_stream(ctx, job, sid).await?;
     }
     let (file, duration, thumb) = posts::media_for(db, &p)?;
+    // Refreshed here, with the database, so an expired sign-in shows on the Accounts page.
+    if let Ok(pr) = crate::oauth::provider(&p.platform) {
+        crate::oauth::access_token_db(db, pr).await?;
+    }
     db.conn().execute("UPDATE posts SET status='uploading', progress=0, error=NULL WHERE id=?1", [id])?;
     let tags: Vec<String> = serde_json::from_str(&p.tags).unwrap_or_default();
     let up = publish::Upload {
@@ -819,7 +897,7 @@ pub async fn scheduler_loop(db: Arc<Db>) {
     loop {
         let due = |kind: &str, hours: i64| -> bool {
             let last: Option<String> = db.conn().query_row("SELECT MAX(created_at) FROM jobs WHERE kind=?1", [kind], |r| r.get(0)).ok().flatten();
-            last.and_then(|l| chrono::DateTime::parse_from_rfc3339(&l).ok()).map_or(true, |t| chrono::Utc::now().signed_duration_since(t).num_hours() >= hours)
+            last.and_then(|l| chrono::DateTime::parse_from_rfc3339(&l).ok()).is_none_or(|t| chrono::Utc::now().signed_duration_since(t).num_hours() >= hours)
         };
         let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
         let connected = |p: &str| -> bool { db.conn().query_row("SELECT COUNT(*) FROM accounts WHERE platform=?1", [p], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0 };
@@ -840,6 +918,35 @@ pub async fn scheduler_loop(db: Arc<Db>) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnails_avoid_nudity_or_blur() {
+        let r = |a: f64, b: f64| nudity::Region { start: a, end: b, bbox: [0.0; 4] };
+        // Clean moment: the usual times.
+        assert_eq!(thumb_times(100.0, 160.0, &[]), (vec![135.0, 150.0, 159.0, 102.0], false));
+        // Nudity around 35 s in: those times are skipped, and none read within 2 s of it.
+        let (t, blur) = thumb_times(100.0, 160.0, &[r(30.0, 40.0)]);
+        assert!(!blur && !t.is_empty());
+        assert!(t.iter().all(|x| x - 100.0 + 2.0 < 30.0 || x - 100.0 - 2.0 > 40.0), "{t:?}");
+        // Nudity all the way through: pixelate.
+        let (t, blur) = thumb_times(100.0, 160.0, &[r(0.0, 60.0)]);
+        assert!(blur && t.len() == 4);
+    }
+
+    #[test]
+    fn censored_key_changes_with_its_inputs() {
+        let s = Settings::default();
+        let k = censored_key("x.mp4", &[(1.0, 2.0)], &[], &s);
+        assert_eq!(k.len(), 16);
+        assert_eq!(k, censored_key("x.mp4", &[(1.0, 2.0)], &[], &s));
+        assert_ne!(k, censored_key("x.mp4", &[(1.0, 2.5)], &[], &s));
+        assert_ne!(k, censored_key("x.mp4", &[(1.0, 2.0)], &[(5.0, 9.0)], &s));
+        assert_ne!(k, censored_key("y.mp4", &[(1.0, 2.0)], &[], &s));
+        let other = Settings { censor_style: format!("{}x", s.censor_style), ..Settings::default() };
+        assert_ne!(k, censored_key("x.mp4", &[(1.0, 2.0)], &[], &other));
+    }
+
     #[test]
     fn hms_formats() {
         assert_eq!(super::hms(12.02), "0:12");

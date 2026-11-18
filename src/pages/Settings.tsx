@@ -3,7 +3,7 @@ import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { Download, ExternalLink, FolderOpen, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { LayoutPicker } from "../components/LayoutPicker";
-import { Badge, Button, Card, Field, Notice, Page, Toggle, inputCls, useConfirm } from "../components/ui";
+import { Badge, Button, Card, Empty, Field, Notice, Page, Toggle, inputCls, useConfirm } from "../components/ui";
 import { api, errorText, type Settings, type Toolchain } from "../lib/api";
 import { usePoll } from "../lib/usePoll";
 
@@ -40,7 +40,7 @@ function GeminiKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
   const confirm = useConfirm();
   const [value, setValue] = useState("");
   const [saved, setSaved] = useState<boolean | null>(null);
-  useEffect(() => { api.secretStatus().then((s) => setSaved(!!s["gemini.api_key"])); }, []);
+  useEffect(() => { api.secretStatus().then((s) => setSaved(!!s["gemini.api_key"])).catch((e) => console.warn("secretStatus failed", e)); }, []);
   const save = async () => {
     try {
       await api.setSecret("gemini.api_key", value.trim());
@@ -66,6 +66,26 @@ function GeminiKey({ onMsg }: { onMsg: (m: { tone: "good" | "bad"; text: string 
   );
 }
 
+/** True while Settings holds edits that were not saved; App asks before navigating away. */
+export const settingsDirty = { current: false };
+
+/** Numeric field that keeps the raw text while typing and only commits an in-range whole number. */
+function NumberInput({ value, min, max, onCommit }: { value: number; min: number; max: number; onCommit: (n: number) => void }) {
+  const [raw, setRaw] = useState(String(value));
+  const bad = raw.trim() === "" || !Number.isFinite(Number(raw)) || Number(raw) < min || Number(raw) > max;
+  return (
+    <input
+      type="number" min={min} max={max} aria-invalid={bad} className={`${inputCls} w-32`} value={raw}
+      onChange={(e) => {
+        setRaw(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value.trim() !== "" && Number.isFinite(n)) onCommit(Math.min(max, Math.max(min, Math.round(n))));
+      }}
+      onBlur={() => setRaw(String(value))}
+    />
+  );
+}
+
 export default function SettingsPage() {
   const [s, setS] = useState<Settings | null>(null);
   const [tools, setTools] = useState<Toolchain | null>(null);
@@ -77,13 +97,35 @@ export default function SettingsPage() {
   const { data: streams } = usePoll(api.streams, 30000);
   const confirm = useConfirm();
 
-  useEffect(() => {
-    api.settings().then(setS);
-    api.toolchain().then(setTools);
-    api.dataDir().then(setDataDir);
-  }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
-  if (!s) return null;
+  useEffect(() => {
+    setLoadError(null);
+    api.settings().then(setS).catch((e) => setLoadError(errorText(e)));
+    api.toolchain().then(setTools).catch((e) => console.warn("toolchain failed", e));
+    api.dataDir().then(setDataDir).catch((e) => console.warn("dataDir failed", e));
+  }, [attempt]);
+
+  useEffect(() => {
+    settingsDirty.current = dirty;
+    return () => { settingsDirty.current = false; };
+  }, [dirty]);
+
+  if (!s) {
+    return (
+      <Page title="Settings">
+        {loadError ? (
+          <Notice tone="bad">
+            <div className="flex items-center justify-between gap-4">
+              <span>Couldn't load settings: {loadError}</span>
+              <Button onClick={() => setAttempt((n) => n + 1)}>Retry</Button>
+            </div>
+          </Notice>
+        ) : <Empty>Loading settings…</Empty>}
+      </Page>
+    );
+  }
   const set = (patch: Partial<Settings>) => {
     setS({ ...s, ...patch });
     setDirty(true);
@@ -117,7 +159,7 @@ export default function SettingsPage() {
                   {ready ? `Installed with the ${engine!.status.model} model.` : engine?.installing ? "Installing… progress shows on the Dashboard." : "Not installed. About 1.2 GB with GPU support, plus the model. Runs fully on your PC."}
                 </div>
               </div>
-              {ready ? <Badge tone="good">Ready</Badge> : <Button variant="primary" disabled={engine?.installing} onClick={async () => { await api.installEngine(); setMsg({ tone: "good", text: "Installing the transcription engine…" }); }}><Download size={14} /> Install</Button>}
+              {ready ? <Badge tone="good">Ready</Badge> : <Button variant="primary" disabled={engine?.installing} onClick={async () => { try { await api.installEngine(); setMsg({ tone: "good", text: "Installing the transcription engine…" }); } catch (e) { setMsg({ tone: "bad", text: errorText(e) }); } }}><Download size={14} /> Install</Button>}
             </div>
             <Field label="Speech model" hint="Small understands Spanish and English much better; Base is faster on weak PCs. Changing it downloads the new model next time.">
               <select className={`${inputCls} w-72`} value={s.whisper_model} onChange={(e) => set({ whisper_model: e.target.value as Settings["whisper_model"] })}>
@@ -134,10 +176,10 @@ export default function SettingsPage() {
                   {engine?.status.speakers_installed ? "Installed. Each voice in a clip gets its own color in the captions and transcript." : engine?.installing_speakers ? "Installing… progress shows on the Dashboard." : "Optional, about 100 MB, runs on your PC. Downloads sherpa-onnx from GitHub. Game audio and overlapping voices can confuse it."}
                 </div>
               </div>
-              {engine?.status.speakers_installed ? <Badge tone="good">Ready</Badge> : <Button disabled={engine?.installing_speakers} onClick={async () => { await api.installSpeakers(); setMsg({ tone: "good", text: "Installing speaker detection…" }); }}><Download size={14} /> Install</Button>}
+              {engine?.status.speakers_installed ? <Badge tone="good">Ready</Badge> : <Button disabled={engine?.installing_speakers} onClick={async () => { try { await api.installSpeakers(); setMsg({ tone: "good", text: "Installing speaker detection…" }); } catch (e) { setMsg({ tone: "bad", text: errorText(e) }); } }}><Download size={14} /> Install</Button>}
             </div>
-            <Field label="Render the best clips automatically" hint="So they're ready to review when you wake up. 0 = render only when you approve.">
-              <input type="number" min={0} max={20} className={`${inputCls} w-32`} value={s.auto_render_top} onChange={(e) => set({ auto_render_top: Number(e.target.value) })} />
+            <Field label="Render the best clips automatically" hint="So they're ready to review when you wake up. 0–20; 0 = render only when you approve.">
+              <NumberInput min={0} max={20} value={s.auto_render_top} onCommit={(n) => set({ auto_render_top: n })} />
             </Field>
             <div>
               <div className="text-sm font-medium">Clip layout</div>
@@ -236,8 +278,8 @@ export default function SettingsPage() {
             </Field>
             <Toggle checked={s.auto_publish} onChange={(v) => set({ auto_publish: v })} label="Full automation" hint="Off: every post waits for you in the Upload Queue. On: the best clips are approved and scheduled automatically after each stream." />
             {s.auto_publish && (
-              <Field label="Posts per day per platform" hint="Automatic posts are spaced evenly through the day.">
-                <input type="number" min={1} max={24} className={`${inputCls} w-32`} value={s.posts_per_day} onChange={(e) => set({ posts_per_day: Number(e.target.value) })} />
+              <Field label="Posts per day per platform" hint="1–24. Automatic posts are spaced evenly through the day.">
+                <NumberInput min={1} max={24} value={s.posts_per_day} onCommit={(n) => set({ posts_per_day: n })} />
               </Field>
             )}
           </div>
@@ -282,7 +324,7 @@ export default function SettingsPage() {
 
         <Card title="Kick monitoring">
           <Field label="Check every (seconds)" hint="30–900. Lower notices stream start/end faster.">
-            <input type="number" min={30} max={900} className={`${inputCls} w-32`} value={s.kick_poll_secs} onChange={(e) => set({ kick_poll_secs: Number(e.target.value) })} />
+            <NumberInput min={30} max={900} value={s.kick_poll_secs} onCommit={(n) => set({ kick_poll_secs: n })} />
           </Field>
         </Card>
 

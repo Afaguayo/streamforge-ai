@@ -1,7 +1,7 @@
 import { save } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Check, Download, ExternalLink, FolderOpen, Pencil, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PageId } from "../App";
 import { useJobs } from "../components/Progress";
 import { StageView } from "../components/StreamBits";
@@ -129,7 +129,7 @@ function EditForm({ c, onDone }: { c: Clip; onDone: (msg: string | null) => void
 const LANG: Record<string, string> = { en: "English", es: "Spanish", pt: "Portuguese", fr: "French", de: "German", it: "Italian" };
 const langName = (l: string | null) => (l ? LANG[l.toLowerCase()] ?? l.toUpperCase() : null);
 
-function ClipCard({ c, posts, refresh, notify }: { c: Clip; posts: Post[]; refresh: () => void; notify: (m: string) => void }) {
+function ClipCard({ c, posts, refresh, notify, focused }: { c: Clip; posts: Post[]; refresh: () => void; notify: (m: string) => void; focused?: boolean }) {
   const [editing, setEditing] = useState(false);
   const [showText, setShowText] = useState(false);
   const p = useJobs();
@@ -153,7 +153,7 @@ function ClipCard({ c, posts, refresh, notify }: { c: Clip; posts: Post[]; refre
     if (dest) act(() => api.downloadClip(c.id, dest), "Clip saved.");
   };
   return (
-    <Card>
+    <Card className={focused ? "ring-1 ring-sky-400" : ""}>
       <div className="flex flex-wrap gap-5 sm:flex-nowrap">
         <div className="w-44 shrink-0">
           {c.render_status === "done" && c.render_path ? (
@@ -274,10 +274,46 @@ export default function ClipStudio({ go }: { go: (p: PageId) => void }) {
   const unprocessed = (streams ?? []).filter((s) => s.status === "probed");
   const currentStream = (streams ?? []).find((s) => s.id === current) ?? null;
   const streamState = currentStream ? streamStage(currentStream, p?.jobs ?? [], clips ?? []) : null;
+  const [focusId, setFocusId] = useState<number | null>(null);
+  const focusIdx = shown.findIndex((c) => c.id === focusId);
+  const listRef = useRef<HTMLDivElement>(null);
+  // One shortcut action at a time, so a held or double-pressed key can't approve a clip twice.
+  const busy = useRef(false);
+  const quick = async (f: () => Promise<unknown>, ok: string) => {
+    if (busy.current) return;
+    busy.current = true;
+    try { await f(); setMsg(ok); await refresh(); } catch (e) { setMsg(errorText(e)); } finally { busy.current = false; }
+  };
+
+  // Keyboard: J/K or Down/Up move between clips, A approves, R rejects. Ignored while typing.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (["INPUT", "TEXTAREA", "SELECT", "VIDEO"].includes(t.tagName) || t.isContentEditable)) return;
+      if (shown.length === 0) return;
+      const k = e.key.toLowerCase();
+      const move = (d: number) => {
+        e.preventDefault();
+        const i = Math.min(shown.length - 1, Math.max(0, (focusIdx < 0 ? (d > 0 ? -1 : shown.length) : focusIdx) + d));
+        setFocusId(shown[i].id);
+        listRef.current?.children[i]?.scrollIntoView({ block: "nearest" });
+      };
+      if (k === "j" || k === "arrowdown") move(1);
+      else if (k === "k" || k === "arrowup") move(-1);
+      else if ((k === "a" || k === "r") && focusIdx >= 0 && !e.repeat) {
+        const c = shown[focusIdx];
+        if (k === "a" && c.status !== "approved") quick(() => api.approveClip(c.id), "Approved. Drafts are in the Upload queue.");
+        else if (k === "r" && c.status !== "rejected") quick(() => api.rejectClip(c.id), "Rejected. You can restore it from the Rejected tab.");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
   const countOf = (t: Clip["status"]) => (clips ?? []).filter((c) => c.stream_id === current && c.status === t).length;
 
   return (
-    <Page title="AI clips" subtitle="The best 60–120 s moments from each stream, ranked. Approve the ones you want to post.">
+    <Page title="AI clips" subtitle="The best 60–120 s moments from each stream, ranked. Approve the ones you want to post. Keys: J/K or ↓/↑ select a clip · A approve · R reject.">
       {msg && <div className="mb-4"><Notice tone="info">{msg}</Notice></div>}
       {engine && !ready && (
         <div className="mb-4">
@@ -328,7 +364,7 @@ export default function ClipStudio({ go }: { go: (p: PageId) => void }) {
         </div>
       )}
 
-      <div className="space-y-4">
+      <div ref={listRef} className="space-y-4">
         {shown.length === 0 ? (
           withClips.length === 0 ? (
             <Empty title="No clips yet" action={<Button onClick={() => go("library")}>Go to Recordings</Button>}>
@@ -340,7 +376,7 @@ export default function ClipStudio({ go }: { go: (p: PageId) => void }) {
             </Empty>
           )
         ) : (
-          shown.map((c) => <ClipCard key={c.id} c={c} posts={posts ?? []} refresh={refresh} notify={setMsg} />)
+          shown.map((c) => <ClipCard key={c.id} c={c} posts={posts ?? []} refresh={refresh} notify={setMsg} focused={c.id === focusId} />)
         )}
       </div>
     </Page>

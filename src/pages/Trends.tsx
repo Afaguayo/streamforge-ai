@@ -11,7 +11,7 @@ export default function Trends() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [kw, setKw] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
-  useEffect(() => { api.settings().then(setSettings); }, []);
+  useEffect(() => { api.settings().then(setSettings).catch((e) => setMsg({ text: errorText(e), bad: true })); }, []);
 
   const saveKeywords = async (list: string[]) => {
     if (!settings) return;

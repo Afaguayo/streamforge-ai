@@ -129,12 +129,12 @@ export function PlatformCard({ p, onChanged }: { p: Platform; onChanged: () => v
   const setupRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    api.secretStatus().then(setSecretStatus);
+    api.secretStatus().then(setSecretStatus).catch((e) => console.warn("secretStatus failed", e));
   }, [p.keys_set]);
 
   const done = (m: Msg) => {
     setMsg(m);
-    api.secretStatus().then(setSecretStatus);
+    api.secretStatus().then(setSecretStatus).catch((e) => console.warn("secretStatus failed", e));
     onChanged();
   };
 
